@@ -204,6 +204,21 @@
         <target state="translated">No se puede crear el índice de imágenes porque no se proporcionó ninguna imagen.</target>
         <note />
       </trans-unit>
+      <trans-unit id="InvalidAuthRealmAllowedAddress">
+        <source>CONTAINER2033: The {0} environment variable contains '{1}', which is not a valid IP address or CIDR range. Separate entries with semicolons.</source>
+        <target state="new">CONTAINER2033: The {0} environment variable contains '{1}', which is not a valid IP address or CIDR range. Separate entries with semicolons.</target>
+        <note>{StrBegins="CONTAINER2033: "} {0} is an environment variable name; {1} is the invalid entry.</note>
+      </trans-unit>
+      <trans-unit id="InvalidAuthRealmPolicy">
+        <source>CONTAINER2034: The {0} environment variable has the value '{1}', which is not a valid policy. Valid values are 'Public', 'AllowlistOnly', and 'None'.</source>
+        <target state="new">CONTAINER2034: The {0} environment variable has the value '{1}', which is not a valid policy. Valid values are 'Public', 'AllowlistOnly', and 'None'.</target>
+        <note>{StrBegins="CONTAINER2034: "} {0} is an environment variable name; {1} is its value. Do not translate 'Public', 'AllowlistOnly', or 'None'.</note>
+      </trans-unit>
+      <trans-unit id="IndexAnnotationsRequireOci">
+        <source>Index-scoped container annotations cannot be written to Docker manifest lists. Use the OCI image format or remove the applicable annotations.</source>
+        <target state="new">Index-scoped container annotations cannot be written to Docker manifest lists. Use the OCI image format or remove the applicable annotations.</target>
+        <note />
+      </trans-unit>
       <trans-unit id="InvalidAuthResponse_DisallowedScheme">
         <source>bearer realm '{0}' uses scheme '{1}' which is not allowed; only 'https' is accepted (or 'http' when the registry is configured as insecure)</source>
         <target state="translated">El dominio de portador '{0}' usa el esquema '{1}' que no está permitido; Solo se acepta "https" (o "http" cuando el registro está configurado como no seguro)</target>
@@ -218,6 +233,16 @@
         <source>bearer realm '{0}' is not a valid absolute URI</source>
         <target state="translated">el '{0}' de dominio de portador no es un URI absoluto válido</target>
         <note>Reason fragment included in InvalidRegistryAuthResponse. {0} is the raw realm value.</note>
+      </trans-unit>
+      <trans-unit id="InvalidAuthResponse_UnexpectedAuthOrigin">
+        <source>authentication challenge origin '{0}' does not match registry origin '{1}'</source>
+        <target state="new">authentication challenge origin '{0}' does not match registry origin '{1}'</target>
+        <note>Reason fragment included in InvalidRegistryAuthResponse. {0} is the origin that returned the authentication challenge; {1} is the expected registry origin.</note>
+      </trans-unit>
+      <trans-unit id="InvalidContainerAnnotationScope">
+        <source>Container annotation '{0}' has invalid Scope '{1}'. Valid values are Manifest, Index, or Manifest,Index.</source>
+        <target state="new">Container annotation '{0}' has invalid Scope '{1}'. Valid values are Manifest, Index, or Manifest,Index.</target>
+        <note />
       </trans-unit>
       <trans-unit id="InvalidContainerImageFormat">
         <source>CONTAINER2031: The container image format '{0}' is not supported. Supported formats are '{1}'.</source>
@@ -323,6 +348,11 @@
         <source>The daemon server reported errors: {0}</source>
         <target state="translated">El servidor demonio notificó los errores: {0}</target>
         <note>{0} are the list of messages, each message starts with new line</note>
+      </trans-unit>
+      <trans-unit id="ManifestAnnotationsRequireOci">
+        <source>Manifest-scoped container annotations cannot be written to Docker image manifests. Use the OCI image format or remove the applicable annotations.</source>
+        <target state="new">Manifest-scoped container annotations cannot be written to Docker image manifests. Use the OCI image format or remove the applicable annotations.</target>
+        <note />
       </trans-unit>
       <trans-unit id="MissingLinkToRegistry">
         <source>CONTAINER2004: Unable to download layer with descriptor '{0}' from registry '{1}' because it does not exist.</source>
