@@ -204,16 +204,6 @@
         <target state="translated">Não é possível criar índice de imagem porque nenhuma imagem foi fornecida.</target>
         <note />
       </trans-unit>
-      <trans-unit id="InvalidAuthRealmAllowedAddress">
-        <source>CONTAINER2033: The {0} environment variable contains '{1}', which is not a valid IP address or CIDR range. Separate entries with semicolons.</source>
-        <target state="new">CONTAINER2033: The {0} environment variable contains '{1}', which is not a valid IP address or CIDR range. Separate entries with semicolons.</target>
-        <note>{StrBegins="CONTAINER2033: "} {0} is an environment variable name; {1} is the invalid entry.</note>
-      </trans-unit>
-      <trans-unit id="InvalidAuthRealmPolicy">
-        <source>CONTAINER2034: The {0} environment variable has the value '{1}', which is not a valid policy. Valid values are 'Public', 'AllowlistOnly', and 'None'.</source>
-        <target state="new">CONTAINER2034: The {0} environment variable has the value '{1}', which is not a valid policy. Valid values are 'Public', 'AllowlistOnly', and 'None'.</target>
-        <note>{StrBegins="CONTAINER2034: "} {0} is an environment variable name; {1} is its value. Do not translate 'Public', 'AllowlistOnly', or 'None'.</note>
-      </trans-unit>
       <trans-unit id="IndexAnnotationsRequireOci">
         <source>Index-scoped container annotations cannot be written to Docker manifest lists. Use the OCI image format or remove the applicable annotations.</source>
         <target state="new">Index-scoped container annotations cannot be written to Docker manifest lists. Use the OCI image format or remove the applicable annotations.</target>
@@ -233,11 +223,6 @@
         <source>bearer realm '{0}' is not a valid absolute URI</source>
         <target state="translated">o domínio do portador '{0}' não é um URI absoluto válido</target>
         <note>Reason fragment included in InvalidRegistryAuthResponse. {0} is the raw realm value.</note>
-      </trans-unit>
-      <trans-unit id="InvalidAuthResponse_UnexpectedAuthOrigin">
-        <source>authentication challenge origin '{0}' does not match registry origin '{1}'</source>
-        <target state="new">authentication challenge origin '{0}' does not match registry origin '{1}'</target>
-        <note>Reason fragment included in InvalidRegistryAuthResponse. {0} is the origin that returned the authentication challenge; {1} is the expected registry origin.</note>
       </trans-unit>
       <trans-unit id="InvalidContainerAnnotationScope">
         <source>Container annotation '{0}' has invalid Scope '{1}'. Valid values are Manifest, Index, or Manifest,Index.</source>
