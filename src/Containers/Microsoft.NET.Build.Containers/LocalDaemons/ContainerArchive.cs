@@ -62,7 +62,7 @@ internal static class ContainerArchive
             using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
 
             JsonArray layerTarballPaths = new();
-            await WriteImageLayersAsync(writer, image, sourceReference, d => $"{d.Substring("sha256:".Length)}/layer.tar", token, layerPaths, layerTarballPaths)
+            await WriteImageLayersAsync(writer, image, d => $"{d.Substring("sha256:".Length)}/layer.tar", token, layerPaths, layerTarballPaths)
                 .ConfigureAwait(false);
 
             string configTarballPath = $"{GetRequiredImageSha(image)}.json";
@@ -83,7 +83,7 @@ internal static class ContainerArchive
         {
             using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
 
-            await WriteOciImageToBlobsAsync(writer, image, sourceReference, token, layerPaths).ConfigureAwait(false);
+            await WriteOciImageToBlobsAsync(writer, image, token, layerPaths).ConfigureAwait(false);
             await WriteIndexJsonForOciImageAsync(writer, image, destinationReference, token).ConfigureAwait(false);
             await WriteOciLayoutAsync(writer, token).ConfigureAwait(false);
         }).ConfigureAwait(false);
@@ -103,7 +103,7 @@ internal static class ContainerArchive
             Debug.Assert(multiArchImage.Images is not null);
             foreach (BuiltImage image in multiArchImage.Images)
             {
-                await WriteOciImageToBlobsAsync(writer, image, sourceReference, token, layerPaths).ConfigureAwait(false);
+                await WriteOciImageToBlobsAsync(writer, image, token, layerPaths).ConfigureAwait(false);
             }
 
             await WriteIndexJsonForMultiArchOciImageAsync(writer, multiArchImage, destinationReference, token)
@@ -198,7 +198,6 @@ internal static class ContainerArchive
     private static async Task WriteImageLayersAsync(
         TarWriter writer,
         BuiltImage image,
-        SourceImageReference sourceReference,
         Func<string, string> layerPathFunc,
         CancellationToken cancellationToken,
         LayerDownloads layerPaths,
@@ -208,14 +207,6 @@ internal static class ContainerArchive
 
         foreach (Descriptor descriptor in image.LayerDescriptors)
         {
-            if (sourceReference.Registry is not { } registry)
-            {
-                throw new NotImplementedException(Resource.FormatString(
-                    nameof(Strings.MissingLinkToRegistry),
-                    descriptor.Digest,
-                    sourceReference.Registry?.ToString() ?? "<null>"));
-            }
-
             cancellationToken.ThrowIfCancellationRequested();
             string localPath = await layerPaths.GetPathAsync(descriptor.Digest, cancellationToken).ConfigureAwait(false);
             string layerTarballPath = layerPathFunc(descriptor.Digest);
@@ -352,11 +343,10 @@ internal static class ContainerArchive
     private static async Task WriteOciImageToBlobsAsync(
         TarWriter writer,
         BuiltImage image,
-        SourceImageReference sourceReference,
         CancellationToken cancellationToken,
         LayerDownloads layerPaths)
     {
-        await WriteImageLayersAsync(writer, image, sourceReference, d => $"{BlobsPath}/{d.Substring("sha256:".Length)}", cancellationToken, layerPaths)
+        await WriteImageLayersAsync(writer, image, d => $"{BlobsPath}/{d.Substring("sha256:".Length)}", cancellationToken, layerPaths)
             .ConfigureAwait(false);
         await WriteImageConfigAsync(writer, image, $"{BlobsPath}/{GetRequiredImageSha(image)}", cancellationToken).ConfigureAwait(false);
         await WriteManifestForOciImageAsync(writer, image, cancellationToken).ConfigureAwait(false);

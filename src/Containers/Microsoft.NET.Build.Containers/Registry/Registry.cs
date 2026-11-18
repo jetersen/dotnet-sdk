@@ -454,8 +454,11 @@ internal sealed class Registry
                     // Break the loop if successful
                     break;
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException and not InvalidAuthResponseException and not InvalidAuthRealmConfigurationException)
+                catch (Exception ex) when ((ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                    && ex is not InvalidAuthResponseException and not InvalidAuthRealmConfigurationException)
                 {
+                    // HttpClient timeouts also throw OperationCanceledException. They
+                    // remain download failures while the publish token is active.
                     retryCount++;
                     if (retryCount >= MaxDownloadRetries)
                     {

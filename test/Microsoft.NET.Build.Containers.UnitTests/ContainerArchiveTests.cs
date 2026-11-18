@@ -379,6 +379,7 @@ public class ContainerArchiveTests
     [TestMethod]
     [DataRow("digest")]
     [DataRow("io")]
+    [DataRow("timeout")]
     [DataRow("cancel")]
     public async Task Failed_partial_downloads_leave_no_blob_or_temporary_archive(string failure)
     {
@@ -417,6 +418,42 @@ public class ContainerArchiveTests
         finally { Directory.Delete(directory, recursive: true); }
     }
 
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Http_timeout_with_an_active_publish_token_retries_and_succeeds(bool duringBody)
+    {
+        using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        byte[] payload = Guid.NewGuid().ToByteArray();
+        string digest = DigestUtils.FormatSha256Digest(Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(payload)));
+        Descriptor descriptor = new(SchemaTypes.OciLayerGzipV1, digest, payload.Length);
+        Mock<IRegistryAPI> api = new(MockBehavior.Strict);
+        int requests = 0;
+        int disposed = 0;
+        api.Setup(a => a.Blob.GetUnvalidatedStreamAsync("repo", digest, It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref requests) == 1)
+                {
+                    return duringBody
+                        ? Task.FromResult<Stream>(new PartialDownloadStream("timeout", cancellation, () => Interlocked.Increment(ref disposed)))
+                        : Task.FromException<Stream>(new TaskCanceledException("fixture HTTP request timeout"));
+                }
+                return Task.FromResult<Stream>(new MemoryStream(payload));
+            });
+        Registry registry = new("localhost:5000", NullLogger.Instance, api.Object, retryDelayProvider: () => TimeSpan.Zero);
+        try
+        {
+            string path = await registry.DownloadBlobAsync("repo", descriptor, cancellation.Token);
+            Assert.IsFalse(cancellation.IsCancellationRequested);
+            Assert.AreSequenceEqual(payload, await File.ReadAllBytesAsync(path, TestContext.CancellationToken));
+            Assert.AreEqual(2, requests);
+            Assert.AreEqual(duringBody ? 1 : 0, disposed);
+            Assert.IsEmpty(Directory.GetFiles(ContentStore.ContentRoot, DigestUtils.GetEncoded(digest) + ".*.tmp"));
+        }
+        finally { File.Delete(ContentStore.PathForDescriptor(descriptor)); }
+    }
+
     private sealed class PartialDownloadStream(string failure, CancellationTokenSource cancellation, Action disposed) : Stream
     {
         private bool _read;
@@ -441,6 +478,7 @@ public class ContainerArchiveTests
                 return ValueTask.FromResult(7);
             }
             if (failure == "digest") return ValueTask.FromResult(0);
+            if (failure == "timeout") throw new TaskCanceledException("fixture HTTP body timeout");
             if (failure == "cancel")
             {
                 cancellation.Cancel();
