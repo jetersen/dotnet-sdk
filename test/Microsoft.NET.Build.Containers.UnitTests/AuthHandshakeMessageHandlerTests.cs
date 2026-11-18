@@ -2683,7 +2683,7 @@ namespace Microsoft.NET.Build.Containers.UnitTests
 
         [TestMethod]
         [DataRow(503, false, false, false, false)]
-        [DataRow(200, true, true, false, false)]
+        [DataRow(200, true, false, false, false)]
         [DataRow(200, false, true, false, false)]
         [DataRow(404, false, false, false, false)]
         [DataRow(404, false, false, true, true)]
