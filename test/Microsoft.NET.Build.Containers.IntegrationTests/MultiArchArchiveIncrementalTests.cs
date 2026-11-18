@@ -42,7 +42,7 @@ public class MultiArchArchiveIncrementalTests : SdkTest
         changed.Should().Pass();
         Assert.Contains("for runtime identifier", changed.StdOut!);
         string[] remoteNames = ReadNames();
-        Assert.IsTrue(remoteNames.All(name => name != "names-test:test"));
+        Assert.ContainsOnly(name => name != "names-test:test", remoteNames);
         var warm = Publish(arguments);
         warm.Should().Pass();
         Assert.DoesNotContain("for runtime identifier", warm.StdOut!);
