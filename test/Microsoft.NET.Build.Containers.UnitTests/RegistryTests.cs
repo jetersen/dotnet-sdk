@@ -184,7 +184,7 @@ public class RegistryTests : IDisposable
         var layerDigest = "sha256:fafafafafafafafafafafafafafafafa";
         var mockLayer = new Mock<Layer>(MockBehavior.Strict);
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[1000]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[1000]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 
@@ -211,7 +211,7 @@ public class RegistryTests : IDisposable
         var chunkSizeLessThanContentLength = 10000;
         var registryUri = new Uri("https://public.ecr.aws");;
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[100000]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[100000]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 
@@ -246,7 +246,7 @@ public class RegistryTests : IDisposable
         var chunkSizeLessThanContentLength = 100000;
         var registryUri = new Uri("https://public.ecr.aws");;
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[contentLength]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[contentLength]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 
@@ -281,7 +281,7 @@ public class RegistryTests : IDisposable
         var chunkSize = 100000;
         var registryUri = new Uri("https://public.ecr.aws");;
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[contentLength]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[contentLength]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 
@@ -324,7 +324,7 @@ public class RegistryTests : IDisposable
         var layerDigest = "sha256:fafafafafafafafafafafafafafafafa";
         var mockLayer = new Mock<Layer>(MockBehavior.Strict);
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[1000]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[1000]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 
@@ -356,7 +356,7 @@ public class RegistryTests : IDisposable
         int chunkSize = 100000;
         var registryUri = new Uri("https://public.ecr.aws");;
         mockLayer
-            .Setup(l => l.OpenBackingFile()).Returns(new MemoryStream(new byte[contentLength]));
+            .Setup(l => l.OpenBackingFile(It.IsAny<CancellationToken>())).Returns(new MemoryStream(new byte[contentLength]));
         mockLayer
             .Setup(l => l.Descriptor).Returns(new Descriptor("blah", layerDigest, 1234));
 

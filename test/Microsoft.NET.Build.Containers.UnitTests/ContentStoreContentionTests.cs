@@ -14,6 +14,28 @@ public class ContentStoreContentionTests
 
     [TestMethod]
     [OSCondition(ConditionMode.Include, OperatingSystems.Windows)]
+    public async Task Push_cancellation_interrupts_an_exclusively_locked_blob_reader()
+    {
+        byte[] content = Guid.NewGuid().ToByteArray();
+        Descriptor descriptor = new(SchemaTypes.OciLayerGzipV1,
+            DigestUtils.FormatSha256Digest(Convert.ToHexStringLower(SHA256.HashData(content))), content.Length);
+        string path = ContentStore.PathForDescriptor(descriptor);
+        using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        try
+        {
+            File.WriteAllBytes(path, content);
+            using FileStream exclusive = new(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            Mock<IRegistryAPI> api = new(MockBehavior.Strict);
+            Registry registry = new("localhost:5000", NullLogger.Instance, api.Object);
+            cancellation.CancelAfter(TimeSpan.FromMilliseconds(100));
+            await Assert.ThrowsAsync<OperationCanceledException>(() => registry.PushLayerAsync(
+                Layer.FromDescriptor(descriptor), "repo", cancellation.Token));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    [OSCondition(ConditionMode.Include, OperatingSystems.Windows)]
     public async Task Committed_blob_readers_allow_a_renaming_handle_to_retain_delete_access()
     {
         byte[] content = Guid.NewGuid().ToByteArray();
@@ -32,7 +54,7 @@ public class ContentStoreContentionTests
             Assert.ThrowsExactly<IOException>(() => { using FileStream denied = File.OpenRead(destination); });
             using FileStream reader = ContentStore.OpenCommittedBlob(destination, TestContext.CancellationToken);
             Assert.AreEqual(content.Length, reader.Length);
-            using Stream pushReader = Layer.FromDescriptor(descriptor).OpenBackingFile();
+            using Stream pushReader = Layer.FromDescriptor(descriptor).OpenBackingFile(TestContext.CancellationToken);
             Assert.AreEqual(content.Length, pushReader.Length);
             Mock<IRegistryAPI> api = new(MockBehavior.Strict);
             string cached = await new Registry("localhost:5000", NullLogger.Instance, api.Object)

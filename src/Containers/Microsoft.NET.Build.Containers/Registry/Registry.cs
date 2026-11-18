@@ -514,7 +514,7 @@ internal sealed class Registry
         cancellationToken.ThrowIfCancellationRequested();
         string digest = layer.Descriptor.Digest;
 
-        using (Stream contents = layer.OpenBackingFile())
+        using (Stream contents = layer.OpenBackingFile(cancellationToken))
         {
             await UploadBlobAsync(repository, digest, contents, cancellationToken).ConfigureAwait(false);
         }

@@ -11,12 +11,14 @@ internal static class BlobDownloadCoordinator
     private const int WindowsSharingViolation = unchecked((int)0x80070020);
     private const int LinuxWouldBlock = 11;
     private const int MacOSWouldBlock = 35;
+    private static readonly TimeSpan MaximumWait = TimeSpan.FromSeconds(30);
     private static readonly Lock s_sync = new();
     private static readonly Dictionary<string, Entry> s_entries = new(
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
     internal static async ValueTask<IDisposable> AcquireAsync(string path, CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
         Entry entry;
         lock (s_sync)
         {
@@ -30,9 +32,15 @@ internal static class BlobDownloadCoordinator
         bool acquired = false;
         try
         {
-            await entry.Semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-            acquired = true;
-            ProcessLease processLease = await AcquireProcessLeaseAsync(path, cancellationToken).ConfigureAwait(false);
+            TimeSpan remaining = MaximumWait - Stopwatch.GetElapsedTime(started);
+            acquired = remaining > TimeSpan.Zero &&
+                await entry.Semaphore.WaitAsync(remaining, cancellationToken).ConfigureAwait(false);
+            if (!acquired)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return new Lease(path, entry, null, monitorCache: true, ownsSemaphore: false);
+            }
+            ProcessLease processLease = await AcquireProcessLeaseAsync(path, started, cancellationToken).ConfigureAwait(false);
             return new Lease(path, entry, processLease.Handle, processLease.TimedOut);
         }
         catch
@@ -55,11 +63,10 @@ internal static class BlobDownloadCoordinator
             ? CacheDownloadRace.RunAsync(path, download, readCache, cancellationToken)
             : download(cancellationToken);
 
-    private static async ValueTask<ProcessLease> AcquireProcessLeaseAsync(string path, CancellationToken cancellationToken)
+    private static async ValueTask<ProcessLease> AcquireProcessLeaseAsync(string path, long started, CancellationToken cancellationToken)
     {
         // Keep the file after release. Unlinking could let waiters lock different inodes.
         string leasePath = path + ".download.lock";
-        long started = Stopwatch.GetTimestamp();
         int retryDelayMilliseconds = 1;
         while (true)
         {
@@ -75,7 +82,7 @@ internal static class BlobDownloadCoordinator
             {
                 held?.Dispose();
                 // Coordination is optional. Never wait indefinitely for an unresponsive owner.
-                if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromSeconds(30))
+                if (Stopwatch.GetElapsedTime(started) >= MaximumWait)
                 {
                     return new ProcessLease(null, TimedOut: true);
                 }
@@ -130,7 +137,7 @@ internal static class BlobDownloadCoordinator
         internal int Users;
     }
 
-    private sealed class Lease(string path, Entry entry, FileStream? processLease, bool monitorCache) : IDisposable
+    private sealed class Lease(string path, Entry entry, FileStream? processLease, bool monitorCache, bool ownsSemaphore = true) : IDisposable
     {
         internal bool MonitorCache { get; } = monitorCache;
         private Entry? _entry = entry;
@@ -142,7 +149,7 @@ internal static class BlobDownloadCoordinator
                 try { processLease?.Dispose(); }
                 finally
                 {
-                    owned.Semaphore.Release();
+                    if (ownsSemaphore) owned.Semaphore.Release();
                     RemoveUser(path, owned);
                 }
             }

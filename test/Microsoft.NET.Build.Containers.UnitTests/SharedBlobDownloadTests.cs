@@ -103,6 +103,55 @@ public class SharedBlobDownloadTests
         }
     }
 
+    [TestMethod]
+    public async Task A_stalled_owner_does_not_block_a_healthy_registry_beyond_the_lease_budget()
+    {
+        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(45));
+        using CancellationTokenSource ownerCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        byte[] content = Guid.NewGuid().ToByteArray();
+        Descriptor descriptor = DescriptorFor(content);
+        TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Mock<IRegistryAPI> ownerApi = new(MockBehavior.Strict);
+        ownerApi.Setup(a => a.Blob.GetUnvalidatedStreamAsync("repo", descriptor.Digest, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new FailingBody(content, started, release.Task, () => { }));
+        Mock<IRegistryAPI> healthyApi = new(MockBehavior.Strict);
+        healthyApi.Setup(a => a.Blob.GetUnvalidatedStreamAsync("repo", descriptor.Digest, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MemoryStream(content));
+        Task<string>? owner = null;
+        Task<string>? healthy = null;
+        try
+        {
+            owner = new Registry("localhost:5000", NullLogger.Instance, ownerApi.Object)
+                .DownloadBlobAsync("repo", descriptor, ownerCancellation.Token);
+            await started.Task.WaitAsync(timeout.Token);
+            healthy = new Registry("localhost:5000", NullLogger.Instance, healthyApi.Object)
+                .DownloadBlobAsync("repo", descriptor, timeout.Token);
+            string path = await healthy.WaitAsync(timeout.Token);
+            Assert.IsFalse(owner.IsCompleted, "A healthy waiter must finish without cancelling the stalled owner.");
+            Assert.AreSequenceEqual(content, await File.ReadAllBytesAsync(path, timeout.Token));
+            healthyApi.Verify(a => a.Blob.GetUnvalidatedStreamAsync("repo", descriptor.Digest, It.IsAny<CancellationToken>()), Times.Once);
+            ownerCancellation.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => owner);
+            // In particular, the timed-out waiter must not release the owner's semaphore.
+            using IDisposable recovered = await BlobDownloadCoordinator.AcquireAsync(path, timeout.Token);
+            Assert.IsEmpty(Directory.GetFiles(ContentStore.ContentRoot, DigestUtils.GetEncoded(descriptor.Digest) + ".*.tmp"));
+        }
+        finally
+        {
+            timeout.Cancel();
+            ownerCancellation.Cancel();
+            release.TrySetResult();
+            foreach (Task<string> task in new[] { owner, healthy }.OfType<Task<string>>())
+            {
+                try { await task; }
+                catch (Exception) { }
+            }
+            RemoveOwnedBlob(descriptor);
+        }
+    }
+
     private static Descriptor DescriptorFor(byte[] bytes) => new(SchemaTypes.OciLayerGzipV1,
         DigestUtils.FormatSha256Digest(Convert.ToHexStringLower(SHA256.HashData(bytes))), bytes.Length);
 
