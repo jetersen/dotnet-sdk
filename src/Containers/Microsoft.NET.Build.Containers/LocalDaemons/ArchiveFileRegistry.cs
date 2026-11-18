@@ -1,7 +1,8 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Microsoft.NET.Build.Containers.Resources;
+using System.Security.Cryptography;
 
 namespace Microsoft.NET.Build.Containers.LocalDaemons;
 
@@ -12,6 +13,10 @@ internal class ArchiveFileRegistry : ILocalRegistry
 {
     public string ArchiveOutputPath { get; private set; }
 
+    internal string? ArchiveDigest { get; private set; }
+
+    internal bool ComputeArchiveDigest { get; set; }
+
     public ArchiveFileRegistry(string archiveOutputPath)
     {
         ArchiveOutputPath = archiveOutputPath;
@@ -21,6 +26,7 @@ internal class ArchiveFileRegistry : ILocalRegistry
         DestinationImageReference destinationReference, CancellationToken cancellationToken,
         Func<T, SourceImageReference, DestinationImageReference, Stream, CancellationToken, Task> writeStreamFunc)
     {
+        ArchiveDigest = null;
         var fullPath = GetArchiveOutputPath(ArchiveOutputPath, destinationReference.Repository);
 
         // create parent directory if required.
@@ -34,13 +40,20 @@ internal class ArchiveFileRegistry : ILocalRegistry
         string temporaryPath = $"{fullPath}.{Guid.NewGuid():N}.tmp";
         try
         {
+            using SHA256? hash = ComputeArchiveDigest ? SHA256.Create() : null;
             await using (var fileStream = File.Create(temporaryPath))
             {
-                // Call the delegate to write the image to the stream
-                await writeStreamFunc(image, sourceReference, destinationReference, fileStream, cancellationToken).ConfigureAwait(false);
+                using CryptoStream? hashingStream = hash is null ? null : new(fileStream, hash, CryptoStreamMode.Write, leaveOpen: true);
+                await writeStreamFunc(image, sourceReference, destinationReference, hashingStream ?? (Stream)fileStream, cancellationToken).ConfigureAwait(false);
+                if (hashingStream is not null)
+                {
+                    await hashingStream.FlushFinalBlockAsync(cancellationToken).ConfigureAwait(false);
+                }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporaryPath, fullPath, overwrite: true);
+            ArchiveDigest = hash is null ? null : Convert.ToHexStringLower(hash.Hash!);
         }
         finally
         {

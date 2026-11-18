@@ -17,3 +17,10 @@ digests. Registry pushes, daemon loads and archives use the same cache. Set
 The separate archive cache can still reuse a complete image archive; disable that with
 `ContainerArchiveNoIncremental=true`. Changed source
 content, permissions, ownership, container paths, image format or epoch invalidate reuse.
+
+Multi-platform archive publishing also reuses unchanged inner image metadata and verified
+application layers. Mutable base tags are resolved before reuse, and the outer archive is
+validated by its full digest. Runtime identifiers, their order and image settings participate
+in cache invalidation. `ContainerArchiveNoIncremental=true` disables both inner and outer
+archive reuse. Cache metadata writes are best effort; cancellation before archive replacement
+preserves the previous file. Archive digests are computed while writing cache misses.

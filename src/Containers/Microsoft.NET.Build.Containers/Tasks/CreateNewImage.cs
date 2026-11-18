@@ -6,6 +6,7 @@ using Microsoft.Build.Framework;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.MSBuild;
 using Microsoft.NET.Build.Containers.Resources;
+using Microsoft.NET.Build.Containers.LocalDaemons;
 using ILogger = Microsoft.Extensions.Logging.ILogger;
 
 namespace Microsoft.NET.Build.Containers.Tasks;
@@ -110,7 +111,7 @@ public sealed partial class CreateNewImage : Microsoft.Build.Utilities.Task, ICa
                 BaseImageDigest,
                 baseImageIsResolved: false,
                 cancellationToken);
-            if (ContainerArchiveCache.TryRestore(this, archiveIncrementalFingerprint))
+            if (ContainerArchiveCache.TryRestore(this, archiveIncrementalFingerprint, cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 return true;
@@ -167,6 +168,11 @@ public sealed partial class CreateNewImage : Microsoft.Build.Utilities.Task, ICa
             OutputRegistry,
             LocalRegistry);
 
+        if (destinationImageReference.LocalRegistry is ArchiveFileRegistry archive)
+        {
+            archive.ComputeArchiveDigest = EnableArchiveIncrementalCache && !string.IsNullOrEmpty(ArchiveIncrementalCachePath);
+        }
+
         var telemetry = new Telemetry(sourceImageReference, destinationImageReference, Log);
 
         ImageBuilder? imageBuilder;
@@ -175,12 +181,28 @@ public sealed partial class CreateNewImage : Microsoft.Build.Utilities.Task, ICa
             try
             {
                 var picker = new RidGraphManifestPicker(RuntimeIdentifierGraphPath);
-                imageBuilder = await registry.GetImageManifestAsync(
+                Registry.ResolvedImageManifest resolved = await registry.ResolveImageManifestAsync(
                     BaseImageName,
                     sourceImageReference.Reference,
                     ContainerRuntimeIdentifier,
                     picker,
                     cancellationToken).ConfigureAwait(false);
+
+                if (EnableArchiveIncrementalCache && archiveIncrementalFingerprint is null)
+                {
+                    archiveIncrementalFingerprint = ContainerArchiveCache.ComputeFingerprint(
+                        this,
+                        resolved.Manifest.GetDigest(),
+                        baseImageIsResolved: true,
+                        cancellationToken);
+                    if (ContainerArchiveCache.TryRestore(this, archiveIncrementalFingerprint, cancellationToken))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return true;
+                    }
+                }
+
+                imageBuilder = await registry.ReadImageConfigurationAsync(BaseImageName, resolved, cancellationToken).ConfigureAwait(false);
             }
             catch (RepositoryNotFoundException)
             {
@@ -222,19 +244,6 @@ public sealed partial class CreateNewImage : Microsoft.Build.Utilities.Task, ICa
             return !Log.HasLoggedErrors;
         }
 
-        if (EnableArchiveIncrementalCache && archiveIncrementalFingerprint is null)
-        {
-            archiveIncrementalFingerprint = ContainerArchiveCache.ComputeFingerprint(
-                this,
-                imageBuilder.BaseImageManifestDigest,
-                baseImageIsResolved: true,
-                cancellationToken);
-            if (ContainerArchiveCache.TryRestore(this, archiveIncrementalFingerprint))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                return true;
-            }
-        }
 
         (string message, object[] parameters) = SkipPublishing ?
             (Strings.ContainerBuilder_StartBuildingImageForRid, new object[] { Repository, ContainerRuntimeIdentifier, sourceImageReference }) :
@@ -331,7 +340,8 @@ public sealed partial class CreateNewImage : Microsoft.Build.Utilities.Task, ICa
 
         if (archiveIncrementalFingerprint is not null && !Log.HasLoggedErrors)
         {
-            ContainerArchiveCache.Save(this, archiveIncrementalFingerprint);
+            ContainerArchiveCache.Save(this, archiveIncrementalFingerprint, cancellationToken,
+                (destinationImageReference.LocalRegistry as ArchiveFileRegistry)?.ArchiveDigest);
         }
 
         return !Log.HasLoggedErrors;

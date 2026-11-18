@@ -43,6 +43,13 @@ feature (`Microsoft.NET.Build.Containers`).
   allows one completed authentication acquisition per request; transport failures before
   acquisition remain retryable within the existing retry budget.
 
+- **Multi-platform archive reuse includes the inner lifecycle.** Resolve mutable bases
+  before a hit, verify cached application blobs and metadata, and include ordered RIDs
+  in the outer fingerprint. Forward archive-cache defaults and opt-outs to inner builds;
+  MSBuild boolean conditions must remain case-insensitive. Keep original output strings,
+  atomic replacement and cancellation. See
+  [ContainerArchiveCache.cs](Microsoft.NET.Build.Containers/Tasks/ContainerArchiveCache.cs).
+
 ## Tests
 
 - **Layer-cache hints only reject candidates.** A hit must validate the canonical source

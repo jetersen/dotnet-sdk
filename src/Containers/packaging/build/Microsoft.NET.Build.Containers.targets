@@ -256,7 +256,8 @@
     <PropertyGroup>
       <_ContainerLayerIncrementalCacheEnabled>true</_ContainerLayerIncrementalCacheEnabled>
       <_ContainerLayerIncrementalCacheEnabled Condition="'$(ContainerLayerNoIncremental)' == 'true'">false</_ContainerLayerIncrementalCacheEnabled>
-      <_ContainerArchiveIncrementalCacheEnabled Condition="'$(ContainerArchiveNoIncremental)' == 'false' and '$(ContainerArchiveOutputPath)' != '' and '$(_IsSingleRIDBuild)' == 'true' and '$(_IsMultiRIDInnerBuild)' != 'true'">true</_ContainerArchiveIncrementalCacheEnabled>
+      <_ContainerArchiveIncrementalCacheEnabled>false</_ContainerArchiveIncrementalCacheEnabled>
+      <_ContainerArchiveIncrementalCacheEnabled Condition="'$(ContainerArchiveNoIncremental)' == 'false' and '$(ContainerArchiveOutputPath)' != '' and '$(_IsSingleRIDBuild)' == 'true'">true</_ContainerArchiveIncrementalCacheEnabled>
       <_ContainerArchiveIncrementalCachePath>$([System.IO.Path]::Combine('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'container', 'publish.cache.json'))</_ContainerArchiveIncrementalCachePath>
     </PropertyGroup>
 
@@ -305,6 +306,7 @@
 
     <ItemGroup>
       <GeneratedContainer Include="GeneratedContainer">
+        <RuntimeIdentifier>$(ContainerRuntimeIdentifier)</RuntimeIdentifier>
         <Manifest>$(GeneratedContainerManifest)</Manifest>
         <Configuration>$(GeneratedContainerConfiguration)</Configuration>
         <ManifestDigest>$(GeneratedContainerDigest)</ManifestDigest>
@@ -350,6 +352,7 @@
           ContainerGenerateLabelsImageBaseDigest=$(ContainerGenerateLabelsImageBaseDigest);
           ContainerPushNoCache=$(ContainerPushNoCache);
           ContainerLayerNoIncremental=$(ContainerLayerNoIncremental);
+          ContainerArchiveNoIncremental=$(ContainerArchiveNoIncremental);
           _SkipContainerPublishing=$(_SkipContainerPublishing);
           ContainerImageFormat=$(_SingleImageContainerFormat);
           _IsMultiRIDBuild=false;
@@ -367,7 +370,14 @@
         <Output TaskParameter="TargetOutputs" ItemName="GeneratedContainer" />
     </MSBuild>
 
+    <PropertyGroup>
+      <_ContainerIndexArchiveIncrementalCacheEnabled>false</_ContainerIndexArchiveIncrementalCacheEnabled>
+      <_ContainerIndexArchiveIncrementalCacheEnabled Condition="'$(ContainerArchiveNoIncremental)' == 'false' and '$(ContainerArchiveOutputPath)' != ''">true</_ContainerIndexArchiveIncrementalCacheEnabled>
+    </PropertyGroup>
+
     <CreateImageIndex
+                      EnableArchiveIncrementalCache="$(_ContainerIndexArchiveIncrementalCacheEnabled)"
+                      ArchiveIncrementalCachePath="$([System.IO.Path]::Combine('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'container', 'index.cache.json'))"
                       GeneratedContainers="@(GeneratedContainer)"
                       LocalRegistry="$(LocalRegistry)"
                       OutputRegistry="$(ContainerRegistry)"

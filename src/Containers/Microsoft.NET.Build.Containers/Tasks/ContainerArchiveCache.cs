@@ -14,7 +14,7 @@ namespace Microsoft.NET.Build.Containers.Tasks;
 
 internal static class ContainerArchiveCache
 {
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
 
     public static string ComputeFingerprint(
         CreateNewImage task,
@@ -28,6 +28,7 @@ internal static class ContainerArchiveCache
         Append(hash, FormatVersion.ToString());
         Append(hash, Constants.Version);
         Append(hash, baseImageManifestDigest);
+        Append(hash, task.ContainerRuntimeIdentifier);
         Append(hash, task.Repository);
         Append(hash, task.WorkingDirectory);
         Append(hash, task.ContainerUser);
@@ -56,7 +57,6 @@ internal static class ContainerArchiveCache
         Append(hash, "EnvironmentVariables", task.ContainerEnvironmentVariables, "Value");
         if (!baseImageIsResolved)
         {
-            Append(hash, task.ContainerRuntimeIdentifier);
             AppendFile(hash, task.RuntimeIdentifierGraphPath, "RuntimeIdentifierGraph", includeMode: false, cancellationToken);
         }
 
@@ -66,18 +66,20 @@ internal static class ContainerArchiveCache
             .OrderBy(path => Path.GetRelativePath(publishDirectory, path), StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            string relativePath = Path.GetRelativePath(publishDirectory, path).Replace('\\', '/');
+            string relativePath = Path.GetRelativePath(publishDirectory, path);
+            if (OperatingSystem.IsWindows()) relativePath = relativePath.Replace('\\', '/');
             AppendFile(hash, path, relativePath, includeMode: true, cancellationToken);
         }
 
         return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
 
-    public static bool TryRestore(CreateNewImage task, string fingerprint)
+    public static bool TryRestore(CreateNewImage task, string fingerprint, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(task.ArchiveOutputPath)
             || string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
-            || !File.Exists(GetArchiveOutputPath(task))
+            || (!task.SkipPublishing && !File.Exists(GetArchiveOutputPath(task)))
             || !File.Exists(task.ArchiveIncrementalCachePath))
         {
             return false;
@@ -92,24 +94,27 @@ internal static class ContainerArchiveCache
         {
             return false;
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
             return false;
         }
 
-        if (entry is null || entry.FormatVersion != FormatVersion || entry.Fingerprint != fingerprint)
+        if (entry is null || entry.FormatVersion != FormatVersion || entry.Fingerprint != fingerprint
+            || entry.ContainerNames is null || entry.ContainerNames.Any(name => name is null)
+            || entry.DigestLabel is { Name: null } or { Value: null })
         {
             return false;
         }
 
         try
         {
-            if (entry.ArchiveDigest != ComputeFileDigest(GetArchiveOutputPath(task)))
+            if (!TryGetContentPath(task, entry, out string contentPath)
+                || entry.ArchiveDigest != ComputeFileDigest(contentPath, cancellationToken))
             {
                 return false;
             }
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or InvalidDigestException or ArgumentException)
         {
             return false;
         }
@@ -130,19 +135,14 @@ internal static class ContainerArchiveCache
         return true;
     }
 
-    public static void Save(CreateNewImage task, string fingerprint)
+    public static void Save(CreateNewImage task, string fingerprint, CancellationToken cancellationToken = default, string? archiveDigest = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(task.ArchiveOutputPath)
             || string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
-            || !File.Exists(GetArchiveOutputPath(task)))
+            || (!task.SkipPublishing && !File.Exists(GetArchiveOutputPath(task))))
         {
             return;
-        }
-
-        string? cacheDirectory = Path.GetDirectoryName(task.ArchiveIncrementalCachePath);
-        if (!string.IsNullOrEmpty(cacheDirectory))
-        {
-            Directory.CreateDirectory(cacheDirectory);
         }
 
         DigestLabel? digestLabel = task.GeneratedDigestLabel is null
@@ -151,24 +151,106 @@ internal static class ContainerArchiveCache
         ArchiveCacheEntry entry = new(
             FormatVersion,
             fingerprint,
-            ComputeFileDigest(GetArchiveOutputPath(task)),
+            task.SkipPublishing
+                ? DigestUtils.GetEncoded(JsonSerializer.Deserialize<ManifestV2>(task.GeneratedContainerManifest)!.Layers.Last().digest)
+                : archiveDigest ?? ComputeFileDigest(GetArchiveOutputPath(task), cancellationToken),
             task.GeneratedContainerManifest,
             task.GeneratedContainerConfiguration,
             task.GeneratedContainerDigest,
             task.GeneratedContainerMediaType,
             task.GeneratedContainerNames.Select(item => item.ItemSpec).ToArray(),
             digestLabel);
-        string temporaryPath = $"{task.ArchiveIncrementalCachePath}.{Guid.NewGuid():N}.tmp";
+        WriteCacheEntry(task.ArchiveIncrementalCachePath, entry, cancellationToken);
+    }
+
+
+    private static bool TryGetContentPath(CreateNewImage task, ArchiveCacheEntry entry, out string path)
+    {
+        path = string.Empty;
+        if (!task.SkipPublishing)
+        {
+            path = GetArchiveOutputPath(task);
+            return true;
+        }
+        if (string.IsNullOrEmpty(entry.Manifest) || string.IsNullOrEmpty(entry.Configuration)) return false;
+        ManifestV2? image = JsonSerializer.Deserialize<ManifestV2>(entry.Manifest);
+        if (image is null || image.Layers is not { Count: > 0 }
+            || string.IsNullOrEmpty(entry.ManifestMediaType) || image.MediaType != entry.ManifestMediaType
+            || entry.ManifestDigest != DigestUtils.ComputeSha256Digest(entry.Manifest)
+            || image.Config.digest != DigestUtils.ComputeSha256Digest(entry.Configuration)
+            || image.Config.size != Encoding.UTF8.GetByteCount(entry.Configuration)) return false;
+        ManifestLayer layer = image.Layers[^1];
+        if (entry.ArchiveDigest != DigestUtils.GetEncoded(layer.digest)) return false;
+        path = ContentStore.PathForDescriptor(new Descriptor(layer.mediaType, layer.digest, layer.size));
+        return new FileInfo(path).Length == layer.size;
+    }
+
+    public static string ComputeIndexFingerprint(MultiArchImage image, string repository, string[] tags, IEnumerable<string>? runtimeIdentifiers = null)
+    {
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Append(hash, FormatVersion.ToString());
+        Append(hash, Constants.Version);
+        Append(hash, image.ImageIndex);
+        Append(hash, repository);
+        Append(hash, "Tags", tags);
+        Append(hash, "RuntimeIdentifiers", runtimeIdentifiers ?? []);
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    public static bool TryRestoreIndex(string archivePath, string cachePath, string fingerprint, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
+            IndexCacheEntry? entry = JsonSerializer.Deserialize<IndexCacheEntry>(File.ReadAllText(cachePath));
+            return entry is not null && entry.FormatVersion == FormatVersion
+                && entry.Fingerprint == fingerprint && entry.ArchiveDigest == ComputeFileDigest(archivePath, cancellationToken);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    public static void SaveIndex(string archivePath, string cachePath, string fingerprint, CancellationToken cancellationToken, string? archiveDigest = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        IndexCacheEntry entry = new(FormatVersion, fingerprint, archiveDigest ?? ComputeFileDigest(archivePath, cancellationToken));
+        WriteCacheEntry(cachePath, entry, cancellationToken);
+    }
+
+    private static void WriteCacheEntry<T>(string cachePath, T entry, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        string? temporaryPath = null;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(cachePath))!);
+            temporaryPath = $"{cachePath}.{Guid.NewGuid():N}.tmp";
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(entry));
-            File.Move(temporaryPath, task.ArchiveIncrementalCachePath, overwrite: true);
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporaryPath, cachePath, overwrite: true);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            // An optional cache write must not invalidate an image already produced.
+            cancellationToken.ThrowIfCancellationRequested();
         }
         finally
         {
-            File.Delete(temporaryPath);
+            if (temporaryPath is not null)
+            {
+                try { File.Delete(temporaryPath); }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
         }
     }
+
+    private sealed record IndexCacheEntry(int FormatVersion, string Fingerprint, string ArchiveDigest);
 
     private static string GetArchiveOutputPath(CreateNewImage task)
         => ArchiveFileRegistry.GetArchiveOutputPath(task.ArchiveOutputPath, task.Repository);
@@ -257,10 +339,20 @@ internal static class ContainerArchiveCache
         hash.AppendData(bytes);
     }
 
-    private static string ComputeFileDigest(string path)
+    private static string ComputeFileDigest(string path, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using FileStream stream = File.OpenRead(path);
-        return Convert.ToHexStringLower(SHA256.HashData(stream));
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] buffer = new byte[81920];
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) != 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            hash.AppendData(buffer, 0, read);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
 
     private sealed record ArchiveCacheEntry(

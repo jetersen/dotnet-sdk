@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 using Microsoft.NET.Build.Containers.Tasks;
@@ -14,6 +16,80 @@ public class CreateNewImageTests
     private const string BaseManifestDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
     public TestContext TestContext { get; set; } = default!;
+
+    [TestMethod]
+    [OSCondition(ConditionMode.Exclude, OperatingSystems.Windows)]
+    public void ArchiveIncrementalFingerprintDistinguishesLiteralBackslashesFromDirectories()
+    {
+        string publishDirectory = CreateTempDirectory();
+        try
+        {
+            string directory = Path.Combine(publishDirectory, "a");
+            Directory.CreateDirectory(directory);
+            string literal = Path.Combine(publishDirectory, @"a\b");
+            File.WriteAllText(literal, "same content");
+            CreateNewImage task = CreateIncrementalTask(publishDirectory);
+            string initial = ComputeResolvedFingerprint(task);
+
+            File.Move(literal, Path.Combine(directory, "b"));
+
+            Assert.AreNotEqual(initial, ComputeResolvedFingerprint(task));
+        }
+        finally
+        {
+            Directory.Delete(publishDirectory, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void Inner_archive_cache_requires_an_intact_application_layer()
+    {
+        string directory = CreateTempDirectory();
+        string? layerPath = null;
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, "app"), Guid.NewGuid().ToString());
+            Layer layer = Layer.FromDirectory(directory, "/app", false, SchemaTypes.OciManifestV1, null,
+                modificationTime: DateTime.UnixEpoch);
+            layerPath = ContentStore.PathForDescriptor(layer.Descriptor);
+            CreateNewImage original = CreateIncrementalTask(directory);
+            original.SkipPublishing = true;
+            original.ArchiveOutputPath = Path.Combine(directory, "outer.tar");
+            original.ArchiveIncrementalCachePath = Path.Combine(directory, "cache.json");
+            original.GeneratedContainerManifest = JsonSerializer.Serialize(new ManifestV2
+            {
+                SchemaVersion = 2,
+                MediaType = SchemaTypes.OciManifestV1,
+                Config = new ManifestConfig(SchemaTypes.OciImageConfigV1, 2, DigestUtils.ComputeSha256Digest("{}")),
+                Layers = [new ManifestLayer(layer.Descriptor.MediaType, layer.Descriptor.Size, layer.Descriptor.Digest, null)]
+            });
+            original.GeneratedContainerConfiguration = "{}";
+            original.GeneratedContainerDigest = DigestUtils.ComputeSha256Digest(original.GeneratedContainerManifest);
+            original.GeneratedContainerMediaType = SchemaTypes.OciManifestV1;
+            ContainerArchiveCache.Save(original, "fingerprint", TestContext.CancellationToken);
+            Assert.IsFalse(File.Exists(original.ArchiveOutputPath));
+            string validMetadata = File.ReadAllText(original.ArchiveIncrementalCachePath);
+            foreach (string field in new[] { "Manifest", "Configuration", "ManifestDigest", "ManifestMediaType" })
+            {
+                JsonNode metadata = JsonNode.Parse(validMetadata)!;
+                metadata[field] = "damaged";
+                File.WriteAllText(original.ArchiveIncrementalCachePath, metadata.ToJsonString());
+                Assert.IsFalse(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken), field);
+            }
+            File.WriteAllText(original.ArchiveIncrementalCachePath, validMetadata);
+
+            Assert.IsTrue(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
+            File.WriteAllText(layerPath, "damaged");
+            Assert.IsFalse(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
+            File.Delete(layerPath);
+            Assert.IsFalse(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
+        }
+        finally
+        {
+            if (layerPath is not null) File.Delete(layerPath);
+            Directory.Delete(directory, recursive: true);
+        }
+    }
 
     [TestMethod]
     public void ArchiveIncrementalFingerprintTracksInputs()
@@ -164,10 +240,11 @@ public class CreateNewImageTests
             task.BaseImageName = "different/image";
             task.BaseImageTag = "different";
             task.BaseImageDigest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-            task.ContainerRuntimeIdentifier = "linux-arm64";
             File.WriteAllText(task.RuntimeIdentifierGraphPath, """{"different":true}""");
 
             Assert.AreEqual(initial, ComputeResolvedFingerprint(task));
+            task.ContainerRuntimeIdentifier = "linux-arm64";
+            Assert.AreNotEqual(initial, ComputeResolvedFingerprint(task));
         }
         finally
         {

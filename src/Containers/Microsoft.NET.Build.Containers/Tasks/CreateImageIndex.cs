@@ -1,6 +1,7 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using Microsoft.NET.Build.Containers.LocalDaemons;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Build.Framework;
@@ -50,9 +51,6 @@ public sealed partial class CreateImageIndex : Microsoft.Build.Utilities.Task, I
         ILoggerFactory msbuildLoggerFactory = new LoggerFactory(new[] { loggerProvider });
         ILogger logger = msbuildLoggerFactory.CreateLogger<CreateImageIndex>();
 
-        RegistryMode sourceRegistryMode = BaseRegistry.Equals(OutputRegistry, StringComparison.InvariantCultureIgnoreCase) ? RegistryMode.PullFromOutput : RegistryMode.Pull;
-        Registry? sourceRegistry = IsLocalPull ? null : new Registry(BaseRegistry, logger, sourceRegistryMode);
-        SourceImageReference sourceImageReference = new(sourceRegistry, BaseImageName, BaseImageTag, BaseImageDigest);
 
         DestinationImageReference destinationImageReference = DestinationImageReference.CreateFromSettings(
             Repository,
@@ -73,12 +71,41 @@ public sealed partial class CreateImageIndex : Microsoft.Build.Utilities.Task, I
         GeneratedImageIndex = multiArchImage.ImageIndex;
         GeneratedArchiveOutputPath = ArchiveOutputPath;
 
+        string? fingerprint = null;
+        string? archivePath = null;
+        if (EnableArchiveIncrementalCache && !string.IsNullOrEmpty(ArchiveOutputPath)
+            && !string.IsNullOrEmpty(ArchiveIncrementalCachePath))
+        {
+            archivePath = ArchiveFileRegistry.GetArchiveOutputPath(ArchiveOutputPath, Repository);
+            fingerprint = ContainerArchiveCache.ComputeIndexFingerprint(multiArchImage, Repository, ImageTags, GeneratedContainers.Select(item => item.GetMetadata("RuntimeIdentifier")));
+            if (ContainerArchiveCache.TryRestoreIndex(archivePath, ArchiveIncrementalCachePath, fingerprint, cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return true;
+            }
+        }
+
+        if (destinationImageReference.LocalRegistry is ArchiveFileRegistry archive)
+        {
+            archive.ComputeArchiveDigest = fingerprint is not null;
+        }
+
         logger.LogInformation(Strings.BuildingImageIndex, destinationImageReference, string.Join(", ", images.Select(i => i.ManifestDigest)));
+
+        RegistryMode sourceRegistryMode = BaseRegistry.Equals(OutputRegistry, StringComparison.InvariantCultureIgnoreCase) ? RegistryMode.PullFromOutput : RegistryMode.Pull;
+        Registry? sourceRegistry = IsLocalPull ? null : new Registry(BaseRegistry, logger, sourceRegistryMode);
+        SourceImageReference sourceImageReference = new(sourceRegistry, BaseImageName, BaseImageTag, BaseImageDigest);
 
         var telemetry = new Telemetry(sourceImageReference, destinationImageReference, Log);
 
         await ImagePublisher.PublishImageAsync(multiArchImage, sourceImageReference, destinationImageReference, Log, telemetry, cancellationToken)
             .ConfigureAwait(false); 
+
+        if (fingerprint is not null && !Log.HasLoggedErrors)
+        {
+            ContainerArchiveCache.SaveIndex(archivePath!, ArchiveIncrementalCachePath, fingerprint, cancellationToken,
+                (destinationImageReference.LocalRegistry as ArchiveFileRegistry)?.ArchiveDigest);
+        }
 
         return !Log.HasLoggedErrors;
     }

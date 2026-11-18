@@ -2,6 +2,11 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Formats.Tar;
+using System.Text;
+using Microsoft.Build.Framework;
+using Microsoft.NET.Build.Containers.Tasks;
+using Moq;
+using TaskItem = Microsoft.Build.Utilities.TaskItem;
 using System.Text.Json;
 using Microsoft.NET.Build.Containers.LocalDaemons;
 
@@ -201,6 +206,184 @@ public class ContainerArchiveTests
         Assert.AreEqual(imageIndex, entries[imageIndexPath]);
         Assert.IsTrue(entries.ContainsKey($"blobs/sha256/{DigestUtils.GetEncoded(images[0].ManifestDigest)}"));
         Assert.IsTrue(entries.ContainsKey($"blobs/sha256/{DigestUtils.GetEncoded(images[1].ManifestDigest)}"));
+    }
+
+    [TestMethod]
+    public void Multi_arch_cache_tracks_order_tags_and_archive_integrity()
+    {
+        string directory = Directory.CreateTempSubdirectory().FullName;
+        string archive = Path.Combine(directory, "image.tar");
+        string cache = Path.Combine(directory, "index.json");
+        BuiltImage[] images = [CreateImage("amd64"), CreateImage("arm64")];
+        try
+        {
+            string fingerprint = Fingerprint(images, ["latest"]);
+            File.WriteAllText(archive, "archive");
+            ContainerArchiveCache.SaveIndex(archive, cache, fingerprint, TestContext.CancellationToken);
+            Assert.IsTrue(ContainerArchiveCache.TryRestoreIndex(archive, cache, fingerprint, TestContext.CancellationToken));
+            using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+            cancellation.Cancel();
+            Assert.ThrowsExactly<OperationCanceledException>(() =>
+                ContainerArchiveCache.TryRestoreIndex(archive, cache, fingerprint, cancellation.Token));
+            Assert.IsFalse(ContainerArchiveCache.TryRestoreIndex(archive, cache, Fingerprint(images.Reverse().ToArray(), ["latest"]), TestContext.CancellationToken));
+            Assert.IsFalse(ContainerArchiveCache.TryRestoreIndex(archive, cache, Fingerprint(images, ["changed"]), TestContext.CancellationToken));
+            var (index, type) = ImageIndexGenerator.GenerateImageIndex(images);
+            MultiArchImage multi = new() { Images = images, ImageIndex = index, ImageIndexMediaType = type };
+            Assert.AreNotEqual(
+                ContainerArchiveCache.ComputeIndexFingerprint(multi, "repo", ["latest"], ["linux-x64", "linux-arm64"]),
+                ContainerArchiveCache.ComputeIndexFingerprint(multi, "repo", ["latest"], ["linux-arm64", "linux-x64"]));
+            File.WriteAllText(archive, "corrupt");
+            Assert.IsFalse(ContainerArchiveCache.TryRestoreIndex(archive, cache, fingerprint, TestContext.CancellationToken));
+            File.WriteAllText(cache, "{");
+            Assert.IsFalse(ContainerArchiveCache.TryRestoreIndex(archive, cache, fingerprint, TestContext.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+
+        static string Fingerprint(BuiltImage[] images, string[] tags)
+        {
+            var (index, type) = ImageIndexGenerator.GenerateImageIndex(images);
+            return ContainerArchiveCache.ComputeIndexFingerprint(
+                new MultiArchImage { Images = images, ImageIndex = index, ImageIndexMediaType = type }, "repo", tags);
+        }
+    }
+
+    [TestMethod]
+    [ResourceLock(WellKnownResources.CurrentDirectory)]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Multi_arch_task_reuses_archive_and_rebuilds_for_changed_tags_and_order(bool relativeOutput)
+    {
+        string directory = Directory.CreateTempSubdirectory().FullName;
+        string archive = Path.Combine(directory, "image.tar");
+        string cache = Path.Combine(directory, "index.json");
+        string archiveArgument = relativeOutput ? Path.GetRelativePath(Environment.CurrentDirectory, archive) : archive;
+        BuiltImage[] images = [CreateImage("amd64"), CreateImage("arm64")];
+        try
+        {
+            using CreateImageIndex first = CreateTask(images, ["latest"]);
+            Assert.IsTrue(await first.ExecuteAsync(TestContext.CancellationToken));
+            byte[] original = await File.ReadAllBytesAsync(archive, TestContext.CancellationToken);
+            DateTime sentinel = new(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            File.SetLastWriteTimeUtc(archive, sentinel);
+            using CreateImageIndex cached = CreateTask(images, ["latest"]);
+            Assert.IsTrue(await cached.ExecuteAsync(TestContext.CancellationToken));
+            Assert.AreEqual(sentinel, File.GetLastWriteTimeUtc(archive));
+            Assert.AreEqual(first.GeneratedImageIndex, cached.GeneratedImageIndex);
+            Assert.AreEqual(archiveArgument, cached.GeneratedArchiveOutputPath);
+            Assert.AreSequenceEqual(original, await File.ReadAllBytesAsync(archive, TestContext.CancellationToken));
+
+            using CreateImageIndex changed = CreateTask(images.Reverse().ToArray(), ["changed"]);
+            Assert.IsTrue(await changed.ExecuteAsync(TestContext.CancellationToken));
+            Assert.AreNotEqual(sentinel, File.GetLastWriteTimeUtc(archive));
+            Assert.AreNotEqual(first.GeneratedImageIndex, changed.GeneratedImageIndex);
+            await File.WriteAllTextAsync(archive, "damaged", TestContext.CancellationToken);
+            using CreateImageIndex repaired = CreateTask(images.Reverse().ToArray(), ["changed"]);
+            Assert.IsTrue(await repaired.ExecuteAsync(TestContext.CancellationToken));
+            Assert.IsGreaterThan((long)"damaged".Length, new FileInfo(archive).Length);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+
+        CreateImageIndex CreateTask(BuiltImage[] orderedImages, string[] tags) => new()
+        {
+            BuildEngine = new Mock<IBuildEngine>().Object,
+            Repository = "repo",
+            ImageTags = tags,
+            ArchiveOutputPath = archiveArgument,
+            EnableArchiveIncrementalCache = true,
+            ArchiveIncrementalCachePath = cache,
+            GeneratedContainers = orderedImages.Select(image =>
+            {
+                TaskItem item = new(image.Architecture);
+                item.SetMetadata("Configuration", image.Config);
+                item.SetMetadata("Manifest", image.Manifest);
+                item.SetMetadata("ManifestDigest", image.ManifestDigest);
+                item.SetMetadata("ManifestMediaType", image.ManifestMediaType);
+                return (ITaskItem)item;
+            }).ToArray()
+        };
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Archive_digest_tracks_exact_committed_bytes_only_when_requested(bool computeDigest)
+    {
+        string directory = Directory.CreateTempSubdirectory().FullName;
+        string path = Path.Combine(directory, "image.tar");
+        ArchiveFileRegistry registry = new(path) { ComputeArchiveDigest = computeDigest };
+        byte[] payload = Encoding.UTF8.GetBytes(Guid.NewGuid().ToString());
+        try
+        {
+            await registry.LoadAsync(new object(), default, new(registry, "repo", ["tag"]), TestContext.CancellationToken,
+                async (_, _, _, stream, token) =>
+                {
+                    stream.Write(payload.AsSpan(0, 5));
+                    await stream.WriteAsync(payload.AsMemory(5), token);
+                });
+            Assert.AreSequenceEqual(payload, await File.ReadAllBytesAsync(path, TestContext.CancellationToken));
+            string expected = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(payload));
+            Assert.AreEqual(computeDigest ? expected : null, registry.ArchiveDigest);
+            await Assert.ThrowsExactlyAsync<IOException>(() => registry.LoadAsync(new object(), default,
+                new(registry, "repo", ["tag"]), TestContext.CancellationToken,
+                (_, _, _, _, _) => throw new IOException("aborted replacement")));
+            Assert.IsNull(registry.ArchiveDigest);
+            Assert.AreSequenceEqual(payload, await File.ReadAllBytesAsync(path, TestContext.CancellationToken));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [TestMethod]
+    public async Task Cancellation_before_archive_replacement_keeps_the_previous_archive()
+    {
+        string directory = Directory.CreateTempSubdirectory().FullName;
+        string path = Path.Combine(directory, "image.tar");
+        using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        ArchiveFileRegistry registry = new(path) { ComputeArchiveDigest = true };
+        try
+        {
+            File.WriteAllText(path, "existing");
+            await Assert.ThrowsAsync<OperationCanceledException>(() => registry.LoadAsync(new object(), default,
+                new(registry, "repo", ["tag"]), cancellation.Token, async (_, _, _, stream, token) =>
+                {
+                    await stream.WriteAsync("new"u8.ToArray(), token);
+                    cancellation.Cancel();
+                }));
+            Assert.AreEqual("existing", File.ReadAllText(path));
+            Assert.IsNull(registry.ArchiveDigest);
+            Assert.HasCount(1, Directory.GetFiles(directory));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [TestMethod]
+    public void Optional_index_metadata_failures_and_cancelled_updates_preserve_output()
+    {
+        string directory = Directory.CreateTempSubdirectory().FullName;
+        string archive = Path.Combine(directory, "image.tar");
+        string cache = Path.Combine(directory, "index.json");
+        try
+        {
+            File.WriteAllText(archive, "archive");
+            ContainerArchiveCache.SaveIndex(archive, cache, "first", TestContext.CancellationToken);
+            string original = File.ReadAllText(cache);
+            using CancellationTokenSource cancellation = new();
+            cancellation.Cancel();
+            Assert.ThrowsExactly<OperationCanceledException>(() => ContainerArchiveCache.SaveIndex(archive, cache, "changed", cancellation.Token));
+            Assert.AreEqual(original, File.ReadAllText(cache));
+            File.Delete(cache);
+            Directory.CreateDirectory(cache);
+            ContainerArchiveCache.SaveIndex(archive, cache, "changed", TestContext.CancellationToken);
+            Assert.IsFalse(ContainerArchiveCache.TryRestoreIndex(archive, cache, "changed", TestContext.CancellationToken));
+            Assert.AreEqual("archive", File.ReadAllText(archive));
+            Assert.IsEmpty(Directory.GetFiles(directory, "*.tmp", SearchOption.AllDirectories));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
     }
 
     private static BuiltImage CreateImage(string architecture)

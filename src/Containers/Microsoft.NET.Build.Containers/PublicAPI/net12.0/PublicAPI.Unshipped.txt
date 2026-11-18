@@ -353,3 +353,7 @@ Microsoft.NET.Build.Containers.ImageIndexV1.Equals(Microsoft.NET.Build.Container
 Microsoft.NET.Build.Containers.ImageIndexV1.Deconstruct(out int schemaVersion, out string! mediaType, out Microsoft.NET.Build.Containers.PlatformSpecificOciManifest[]! manifests) -> void
 Microsoft.NET.Build.Containers.Tasks.CreateNewImage.EnableLayerIncrementalCache.get -> bool
 Microsoft.NET.Build.Containers.Tasks.CreateNewImage.EnableLayerIncrementalCache.set -> void
+Microsoft.NET.Build.Containers.Tasks.CreateImageIndex.EnableArchiveIncrementalCache.get -> bool
+Microsoft.NET.Build.Containers.Tasks.CreateImageIndex.EnableArchiveIncrementalCache.set -> void
+Microsoft.NET.Build.Containers.Tasks.CreateImageIndex.ArchiveIncrementalCachePath.get -> string!
+Microsoft.NET.Build.Containers.Tasks.CreateImageIndex.ArchiveIncrementalCachePath.set -> void

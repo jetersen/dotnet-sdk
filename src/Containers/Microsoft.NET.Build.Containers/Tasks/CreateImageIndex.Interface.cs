@@ -49,6 +49,12 @@ partial class CreateImageIndex
     /// </summary>
     public string ArchiveOutputPath { get; set; }
 
+    /// <summary>Enables reuse of an unchanged multi-platform archive after the inner builds resolve their base images.</summary>
+    public bool EnableArchiveIncrementalCache { get; set; }
+
+    /// <summary>The file used to persist the multi-platform archive fingerprint.</summary>
+    public string ArchiveIncrementalCachePath { get; set; } = string.Empty;
+
     /// <summary>
     /// The kind of local registry to use, if any.
     /// </summary>

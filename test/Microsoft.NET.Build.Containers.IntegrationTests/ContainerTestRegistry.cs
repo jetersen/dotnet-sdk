@@ -1,0 +1,112 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+
+namespace Microsoft.NET.Build.Containers.IntegrationTests;
+
+internal sealed class ContainerTestRegistry : IAsyncDisposable
+{
+    private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+    private readonly CancellationTokenSource _stop = new();
+    private readonly ConcurrentDictionary<string, (string MediaType, byte[] Bytes)> _responses = new();
+    private readonly List<Task> _connections = [];
+    private readonly Task _server;
+    private int _configurationRequests;
+
+    internal int ConfigurationRequests => _configurationRequests;
+    internal string Address { get; }
+
+    internal ContainerTestRegistry()
+    {
+        ChangeBaseManifests("first");
+        _listener.Start();
+        Address = $"127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}";
+        _server = ServeAsync();
+    }
+
+    internal void ChangeBaseManifests(string variant, bool changeConfiguration = false)
+    {
+        List<object> manifests = [];
+        object[] layers = [];
+        string[] diffIds = [];
+        foreach (string architecture in new[] { "amd64", "arm64" })
+        {
+            var config = Add(new { architecture, os = "linux", config = changeConfiguration ? new Dictionary<string, object> { ["Env"] = new[] { "CONFIG_VARIANT=" + variant } } : new Dictionary<string, object>(), rootfs = new { type = "layers", diff_ids = diffIds } }, SchemaTypes.OciImageConfigV1, "blobs");
+            var manifest = Add(new { schemaVersion = 2, mediaType = SchemaTypes.OciManifestV1, config = new { config.mediaType, config.digest, config.size }, layers, annotations = new Dictionary<string, string> { ["test.variant"] = variant } }, SchemaTypes.OciManifestV1, "manifests");
+            manifests.Add(new { manifest.mediaType, manifest.digest, manifest.size, platform = new { architecture, os = "linux" } });
+        }
+        byte[] index = JsonSerializer.SerializeToUtf8Bytes(new { schemaVersion = 2, mediaType = SchemaTypes.OciImageIndexV1, manifests });
+        _responses["/v2/empty/manifests/latest"] = (SchemaTypes.OciImageIndexV1, index);
+    }
+
+    private (string mediaType, string digest, int size) Add(object value, string mediaType, string kind)
+    {
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(value);
+        string digest = DigestUtils.ComputeSha256Digest(Encoding.UTF8.GetString(bytes));
+        _responses[$"/v2/empty/{kind}/{digest}"] = (mediaType, bytes);
+        return (mediaType, digest, bytes.Length);
+    }
+
+    private async Task ServeAsync()
+    {
+        try
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                TcpClient client = await _listener.AcceptTcpClientAsync(_stop.Token);
+                _connections.Add(RespondAsync(client));
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+    }
+
+    private async Task RespondAsync(TcpClient client)
+    {
+        using (client)
+        {
+            NetworkStream stream = client.GetStream();
+            byte[] firstByte = new byte[1];
+            if (await stream.ReadAsync(firstByte, _stop.Token) != 1)
+            {
+                return;
+            }
+            // The registry client tries HTTPS first, then uses HTTP for an explicitly
+            // insecure registry. Close TLS probes promptly rather than awaiting an HTTP line.
+            if (firstByte[0] != (byte)'G')
+            {
+                return;
+            }
+            using StreamReader reader = new(stream, leaveOpen: true);
+            string? line = await reader.ReadLineAsync(_stop.Token);
+            string path = line!.Split(' ')[1];
+            while (!string.IsNullOrEmpty(await reader.ReadLineAsync(_stop.Token))) { }
+            bool found = _responses.TryGetValue(path, out var response);
+            if (found && response.MediaType == SchemaTypes.OciImageConfigV1)
+            {
+                Interlocked.Increment(ref _configurationRequests);
+            }
+            byte[] bytes = found ? response.Bytes : [];
+            string headers = $"HTTP/1.1 {(found ? "200 OK" : "404 Not Found")}\r\nContent-Type: {(found ? response.MediaType : "application/json")}\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n";
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(headers), _stop.Token);
+            await stream.WriteAsync(bytes, _stop.Token);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _stop.Cancel();
+        _listener.Stop();
+        await _server;
+        try
+        {
+            await Task.WhenAll(_connections);
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        _stop.Dispose();
+    }
+}

@@ -188,7 +188,15 @@ internal sealed class Registry
     /// </summary>
     private bool SupportsParallelUploads => !IsAmazonECRRegistry && _settings.ParallelUploadEnabled;
 
+    internal readonly record struct ResolvedImageManifest(ManifestV2 Manifest, string MediaType);
+
     public async Task<ImageBuilder> GetImageManifestAsync(string repositoryName, string reference, string runtimeIdentifier, IManifestPicker manifestPicker, CancellationToken cancellationToken)
+    {
+        ResolvedImageManifest resolved = await ResolveImageManifestAsync(repositoryName, reference, runtimeIdentifier, manifestPicker, cancellationToken).ConfigureAwait(false);
+        return await ReadImageConfigurationAsync(repositoryName, resolved, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<ResolvedImageManifest> ResolveImageManifestAsync(string repositoryName, string reference, string runtimeIdentifier, IManifestPicker manifestPicker, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ManifestResponse initialManifestResponse = await _registryAPI.Manifest.GetAsync(repositoryName, reference, cancellationToken).ConfigureAwait(false);
@@ -198,11 +206,8 @@ internal sealed class Registry
         string? mediaType = initialManifestResponse.MediaType;
         return mediaType switch
         {
-            SchemaTypes.DockerManifestV2 or SchemaTypes.OciManifestV1 => await ReadSingleImageAsync(
-                repositoryName,
-                ToManifestV2(manifestBytes, verifiedDigest, mediaType),
-                mediaType,
-                cancellationToken).ConfigureAwait(false),
+            SchemaTypes.DockerManifestV2 or SchemaTypes.OciManifestV1 => new ResolvedImageManifest(
+                ToManifestV2(manifestBytes, verifiedDigest, mediaType), mediaType),
             SchemaTypes.DockerManifestListV2 => await PickBestImageFromManifestListAsync(
                 repositoryName,
                 reference,
@@ -236,9 +241,11 @@ internal sealed class Registry
         }
     }
 
-    private async Task<ImageBuilder> ReadSingleImageAsync(string repositoryName, ManifestV2 manifest, string manifestMediaType, CancellationToken cancellationToken)
+    internal async Task<ImageBuilder> ReadImageConfigurationAsync(string repositoryName, ResolvedImageManifest resolved, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        ManifestV2 manifest = resolved.Manifest;
+        string manifestMediaType = resolved.MediaType;
         ManifestConfig config = manifest.Config;
         string configSha = config.digest;
 
@@ -312,7 +319,7 @@ internal sealed class Registry
     }
 
 
-    private async Task<ImageBuilder> PickBestImageFromManifestListAsync(
+    private async Task<ResolvedImageManifest> PickBestImageFromManifestListAsync(
         string repositoryName,
         string reference,
         ManifestListV2 manifestList,
@@ -339,7 +346,7 @@ internal sealed class Registry
         }
     }
 
-    private async Task<ImageBuilder> PickBestImageFromImageIndexAsync(
+    private async Task<ResolvedImageManifest> PickBestImageFromImageIndexAsync(
         string repositoryName,
         string reference,
         ImageIndexV1 index,
@@ -366,7 +373,7 @@ internal sealed class Registry
         }
     }
 
-    private async Task<ImageBuilder> ReadImageFromManifest(
+    private async Task<ResolvedImageManifest> ReadImageFromManifest(
         string repositoryName,
         string reference,
         string manifestDigest,
@@ -388,8 +395,7 @@ internal sealed class Registry
             throw new BaseImageNotFoundException(runtimeIdentifier, repositoryName, reference, rids);
 
         manifest.KnownDigest = manifestDigest;
-        return await ReadSingleImageAsync(repositoryName, manifest, mediaType, cancellationToken)
-            .ConfigureAwait(false);
+        return new ResolvedImageManifest(manifest, mediaType);
     }
 
     /// <summary>
