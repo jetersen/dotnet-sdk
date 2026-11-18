@@ -50,7 +50,7 @@ public class CreateNewImageTests
         {
             File.WriteAllText(Path.Combine(directory, "app"), Guid.NewGuid().ToString());
             Layer layer = Layer.FromDirectory(directory, "/app", false, SchemaTypes.OciManifestV1, null,
-                modificationTime: DateTime.UnixEpoch);
+                modificationTime: DateTime.UnixEpoch, cancellationToken: TestContext.CancellationToken);
             layerPath = ContentStore.PathForDescriptor(layer.Descriptor);
             CreateNewImage original = CreateIncrementalTask(directory);
             original.SkipPublishing = true;
@@ -349,7 +349,7 @@ public class CreateNewImageTests
                 BaseManifestDigest,
                 baseImageIsResolved: false,
                 TestContext.CancellationToken);
-            ContainerArchiveCache.Save(original, fingerprint);
+            ContainerArchiveCache.Save(original, fingerprint, TestContext.CancellationToken);
             DateTime archiveWriteTime = File.GetLastWriteTimeUtc(resolvedArchivePath);
 
             CreateNewImage cached = CreateIncrementalTask(publishDirectory);
@@ -392,7 +392,7 @@ public class CreateNewImageTests
             Assert.AreEqual("", invalidEpoch.GeneratedContainerManifest);
 
             File.WriteAllText(resolvedArchivePath, "different archive");
-            Assert.IsFalse(ContainerArchiveCache.TryRestore(cached, fingerprint));
+            Assert.IsFalse(ContainerArchiveCache.TryRestore(cached, fingerprint, TestContext.CancellationToken));
         }
         finally
         {
