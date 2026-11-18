@@ -2631,6 +2631,223 @@ namespace Microsoft.NET.Build.Containers.UnitTests
             });
         }
 
+        [TestMethod]
+        public async Task Transport_retry_does_not_replace_authentication_accepted_during_backoff()
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                TaskCompletionSource backoffStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource resumeRetry = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                int tokens = 0;
+                int ownerAttempts = 0;
+                string? lastAuthorization = null;
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new ServerMessageHandler(request =>
+                    {
+                        string? authorization = request.Headers.Authorization?.Parameter;
+                        if (authorization is null) return CreateRequestAuthenticateResponse("Bearer", $"realm=\"{BearerRealmUrl}\"");
+                        if (request.RequestUri!.AbsolutePath.EndsWith("/owner", StringComparison.Ordinal)
+                            && Interlocked.Increment(ref ownerAttempts) == 1)
+                        {
+                            throw new HttpRequestException(HttpRequestError.ConnectionError, "transport failed",
+                                new IOException("socket failed", new SocketException()));
+                        }
+                        lastAuthorization = authorization;
+                        return new HttpResponseMessage(HttpStatusCode.OK);
+                    }), NullLogger.Instance, RegistryMode.Pull,
+                    realmHandlerFactory: _ => new ServerMessageHandler(_ => CreateBearerTokenResponse($"token-{Interlocked.Increment(ref tokens)}")),
+                    delay: async (_, cancellationToken) =>
+                    {
+                        backoffStarted.TrySetResult();
+                        await resumeRetry.Task.WaitAsync(cancellationToken);
+                    }));
+                Task<HttpResponseMessage> owner = client.GetAsync(RequestUrl + "/owner", timeout.Token);
+                await backoffStarted.Task.WaitAsync(timeout.Token);
+                try
+                {
+                    using HttpResponseMessage winner = await client.GetAsync(RequestUrl + "/winner", timeout.Token);
+                    Assert.AreEqual(HttpStatusCode.OK, winner.StatusCode);
+                }
+                finally { resumeRetry.TrySetResult(); }
+                using HttpResponseMessage recoveredOwner = await owner;
+                Assert.AreEqual(HttpStatusCode.OK, recoveredOwner.StatusCode);
+                using HttpResponseMessage probe = await client.GetAsync(RequestUrl + "/probe", timeout.Token);
+                Assert.AreEqual(HttpStatusCode.OK, probe.StatusCode);
+                Assert.AreEqual("token-2", lastAuthorization);
+                Assert.AreEqual(2, tokens);
+            });
+        }
+
+        [TestMethod]
+        [DataRow(503, false, false, false, false)]
+        [DataRow(200, true, true, false, false)]
+        [DataRow(200, false, true, false, false)]
+        [DataRow(404, false, false, false, false)]
+        [DataRow(404, false, false, true, true)]
+        [DataRow(200, false, false, false, true)]
+        public async Task Authentication_sharing_requires_an_authenticated_registry_response(
+            int status, bool externalRedirect, bool clearAuthorization, bool head, bool share)
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                TaskCompletionSource allArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                int arrivals = 0;
+                int tokens = 0;
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new AsyncServerMessageHandler(async (request, cancellationToken) =>
+                    {
+                        if (request.Headers.Authorization is null)
+                        {
+                            if (Interlocked.Increment(ref arrivals) == 2) allArrived.TrySetResult();
+                            await allArrived.Task.WaitAsync(cancellationToken);
+                            return CreateRequestAuthenticateResponse("Bearer", $"realm=\"{BearerRealmUrl}\"");
+                        }
+                        // Simulate the final request state after HttpClient follows a redirect.
+                        if (externalRedirect) request.RequestUri = new Uri("https://blob.test/redirected");
+                        if (clearAuthorization) request.Headers.Authorization = null;
+                        return new HttpResponseMessage((HttpStatusCode)status) { RequestMessage = request };
+                    }), NullLogger.Instance, RegistryMode.Pull,
+                    realmHandlerFactory: _ => new ServerMessageHandler(_ => CreateBearerTokenResponse($"token-{Interlocked.Increment(ref tokens)}"))));
+                using HttpRequestMessage first = new(head ? HttpMethod.Head : HttpMethod.Get, RequestUrl);
+                using HttpRequestMessage second = new(head ? HttpMethod.Head : HttpMethod.Get, RequestUrl);
+                HttpResponseMessage[] responses = await Task.WhenAll(client.SendAsync(first, timeout.Token), client.SendAsync(second, timeout.Token));
+                try
+                {
+                    Assert.ContainsOnly(response => response.StatusCode == (HttpStatusCode)status, responses);
+                    Assert.AreEqual(share ? 1 : 2, tokens);
+                }
+                finally { foreach (HttpResponseMessage response in responses) response.Dispose(); }
+            });
+        }
+
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public async Task Rejected_borrowed_authentication_can_acquire_once(bool rejectAcquiredToken)
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                TaskCompletionSource allArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource ownerAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                int arrivals = 0;
+                int tokens = 0;
+                int borrowedAttempts = 0;
+                int acquiredAttempts = 0;
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new AsyncServerMessageHandler(async (request, cancellationToken) =>
+                    {
+                        bool borrower = request.RequestUri!.AbsolutePath.EndsWith("/borrower", StringComparison.Ordinal);
+                        string? authorization = request.Headers.Authorization?.Parameter;
+                        if (authorization is null)
+                        {
+                            if (Interlocked.Increment(ref arrivals) == 2) allArrived.TrySetResult();
+                            await allArrived.Task.WaitAsync(cancellationToken);
+                            if (borrower) await ownerAccepted.Task.WaitAsync(cancellationToken);
+                        }
+                        else if (!borrower)
+                        {
+                            ownerAccepted.TrySetResult();
+                            return new HttpResponseMessage(HttpStatusCode.OK);
+                        }
+                        else if (authorization == "token-1") Interlocked.Increment(ref borrowedAttempts);
+                        else
+                        {
+                            Interlocked.Increment(ref acquiredAttempts);
+                            if (!rejectAcquiredToken) return new HttpResponseMessage(HttpStatusCode.OK);
+                        }
+                        return CreateRequestAuthenticateResponse("Bearer", $"realm=\"{BearerRealmUrl}\"");
+                    }), NullLogger.Instance, RegistryMode.Pull,
+                    realmHandlerFactory: _ => new ServerMessageHandler(_ => CreateBearerTokenResponse($"token-{Interlocked.Increment(ref tokens)}"))));
+                Task<HttpResponseMessage> owner = client.GetAsync(RequestUrl + "/owner", timeout.Token);
+                Task<HttpResponseMessage> borrower = client.GetAsync(RequestUrl + "/borrower", timeout.Token);
+                using HttpResponseMessage ownerResponse = await owner;
+                using HttpResponseMessage borrowerResponse = await borrower;
+                Assert.AreEqual(HttpStatusCode.OK, ownerResponse.StatusCode);
+                Assert.AreEqual(rejectAcquiredToken ? HttpStatusCode.Unauthorized : HttpStatusCode.OK, borrowerResponse.StatusCode);
+                Assert.AreEqual(1, borrowedAttempts);
+                Assert.AreEqual(1, acquiredAttempts);
+                Assert.AreEqual(2, tokens);
+            });
+        }
+
+        [TestMethod]
+        [OSCondition(ConditionMode.Exclude, OperatingSystems.Windows)]
+        public async Task Cancelled_credential_helper_lookup_releases_authentication_ownership()
+        {
+            string root = Directory.CreateTempSubdirectory().FullName;
+            string helperName = "cancel-" + Guid.NewGuid().ToString("N");
+            string helper = Path.Combine(root, "docker-credential-" + helperName);
+            string started = Path.Combine(root, "started");
+            string release = Path.Combine(root, "release");
+            string finished = Path.Combine(root, "finished");
+            string? oldPath = Environment.GetEnvironmentVariable("PATH");
+            using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            try
+            {
+                await File.WriteAllTextAsync(helper, """
+                    #!/bin/sh
+                    IFS= read -r registry
+                    state_dir="$(dirname "$0")"
+                    if mkdir "$state_dir/owner" 2>/dev/null; then
+                        printf '%s' "$$" > "$state_dir/started.tmp"
+                        mv "$state_dir/started.tmp" "$state_dir/started"
+                        attempt=0
+                        while [ ! -f "$state_dir/release" ] && [ "$attempt" -lt 500 ]; do
+                            sleep 0.02
+                            attempt=$((attempt + 1))
+                        done
+                        printf 'done' > "$state_dir/finished"
+                    fi
+                    printf '{"Username":"user","Secret":"pass"}'
+                    """, timeout.Token);
+                if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(helper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                Environment.SetEnvironmentVariable("PATH", root + Path.PathSeparator + oldPath);
+                using RegistryAuthFileScope credentials = new(System.Text.Json.JsonSerializer.Serialize(
+                    new { credHelpers = new Dictionary<string, string> { [TestRegistryName] = helperName } }));
+                using CancellationTokenSource ownerCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new ServerMessageHandler(request => request.Headers.Authorization?.Parameter == "accepted"
+                        ? new HttpResponseMessage(HttpStatusCode.OK)
+                        : CreateRequestAuthenticateResponse("Bearer", $"realm=\"{BearerRealmUrl}\"")),
+                    NullLogger.Instance, RegistryMode.Pull,
+                    realmHandlerFactory: _ => new ServerMessageHandler(_ => CreateBearerTokenResponse("accepted"))));
+                Task<HttpResponseMessage> owner = Task.Run(() => client.GetAsync(RequestUrl, ownerCancellation.Token), timeout.Token);
+                while (!File.Exists(started)) await Task.Delay(10, timeout.Token);
+                ownerCancellation.Cancel();
+                await Assert.ThrowsAsync<OperationCanceledException>(() => owner.WaitAsync(TimeSpan.FromSeconds(2), timeout.Token));
+                using HttpResponseMessage sibling = await client.GetAsync(RequestUrl, timeout.Token);
+                Assert.AreEqual(HttpStatusCode.OK, sibling.StatusCode);
+                Assert.IsFalse(File.Exists(finished), "Sibling must finish while the cancelled owner's helper is still blocked.");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("PATH", oldPath);
+                await File.WriteAllTextAsync(release, "release", CancellationToken.None);
+                if (File.Exists(started))
+                {
+                    try
+                    {
+                        using System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(int.Parse(await File.ReadAllTextAsync(started, CancellationToken.None)));
+                        using CancellationTokenSource cleanup = new(TimeSpan.FromSeconds(5));
+                        await process.WaitForExitAsync(cleanup.Token);
+                    }
+                    catch (ArgumentException) { } // The fixture helper has already exited.
+                }
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
         /// <summary>
         /// Rejects every issued token and verifies that each request performs at most one
         /// handshake and that a rejected candidate is not cached for the next request.

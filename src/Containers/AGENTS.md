@@ -46,7 +46,10 @@ feature (`Microsoft.NET.Build.Containers`).
   scope and Basic parameters before reusing a concurrently accepted credential. Keep
   acquisition and its first validated response together; release the lock before a retry
   that reuses accepted authentication. Cancellation or failure must release acquisition
-  ownership without cancelling sibling requests.
+  ownership without cancelling sibling requests. Only the lock owner can publish accepted
+  state, and a redirect or transient failure is not proof of registry acceptance. A rejected
+  borrowed credential retains one independent acquisition. The pinned provider cannot
+  terminate a running helper; cancellation stops waiting for its lookup instead.
 
 ## Tests
 

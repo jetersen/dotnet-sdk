@@ -204,7 +204,11 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
         }
         else
         {
-            privateRepoCreds = await GetLoginCredentials(registry).ConfigureAwait(false);
+            // The pinned provider can execute credential helpers synchronously. Run the
+            // lookup separately so cancellation can release acquisition ownership promptly.
+            // The provider still owns the lifetime of a helper already in progress.
+            privateRepoCreds = await Task.Run(() => GetLoginCredentials(registry, cancellationToken), cancellationToken)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (scheme.Equals(BasicAuthScheme, StringComparison.OrdinalIgnoreCase))
@@ -488,8 +492,9 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
         return (new AuthenticationHeaderValue(BearerAuthScheme, token.ResolvedToken), token.ResolvedExpiration);
     }
 
-    private static async Task<DockerCredentials> GetLoginCredentials(string registry)
+    private static async Task<DockerCredentials> GetLoginCredentials(string registry, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         // For authentication with Docker Hub, 'docker login' uses 'https://index.docker.io/v1/' as the registry key.
         // And 'podman login docker.io' uses 'docker.io'.
         // Try the key used by 'docker' first, and then fall back to the regular case for 'podman'.
@@ -497,17 +502,22 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
         {
             try
             {
-                return await CredsProvider.GetCredentialsAsync("https://index.docker.io/v1/").ConfigureAwait(false);
+                DockerCredentials credentials = await CredsProvider.GetCredentialsAsync("https://index.docker.io/v1/").ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                return credentials;
             }
-            catch
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
             { }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
-            return await CredsProvider.GetCredentialsAsync(registry).ConfigureAwait(false);
+            DockerCredentials credentials = await CredsProvider.GetCredentialsAsync(registry).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            return credentials;
         }
-        catch (Exception e)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
             throw new CredentialRetrievalException(registry, e);
         }
@@ -532,6 +542,7 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
         CachedAuthentication? authenticationToCache = null;
 
         bool acquiredAuthentication = false;
+        bool borrowedAuthentication = false;
         bool ownsAuthenticationLock = false;
         try
         {
@@ -549,14 +560,19 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
 
                     var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
                     ValidateAuthenticationOrigin(response, request.RequestUri);
-                    if (acquiredAuthentication && authenticationToCache is not null && response.StatusCode != HttpStatusCode.Unauthorized)
+                    HttpRequestMessage finalRequest = response.RequestMessage ?? request;
+                    if (ownsAuthenticationLock && acquiredAuthentication && authenticationToCache is not null
+                        && finalRequest.RequestUri is { } finalUri && IsRegistryOrigin(finalUri)
+                        && authenticationToCache.Header.Equals(finalRequest.Headers.Authorization)
+                        && (response.IsSuccessStatusCode
+                            || (finalRequest.Method == HttpMethod.Head && response.StatusCode == HttpStatusCode.NotFound)))
                     {
                         Interlocked.Exchange(ref _authentication, authenticationToCache);
                     }
 
                     if (response.StatusCode != HttpStatusCode.Unauthorized
                         || !isRegistryOrigin
-                        || authenticationToCache is not null)
+                        || acquiredAuthentication)
                     {
                         return response;
                     }
@@ -579,6 +595,14 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
                         return response;
                     }
 
+                    // A borrowed credential may have expired since its owner's accepted
+                    // response. Keep this request's one independent acquisition available.
+                    if (authenticationToCache is not null)
+                    {
+                        attemptedAuthentication = authenticationToCache;
+                        authenticationToCache = null;
+                    }
+
                     string? basicParameters = authInfo is null ? response.Headers.WwwAuthenticate.First().Parameter : null;
                     using (response)
                     {
@@ -593,7 +617,7 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
                     await _authenticationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                     ownsAuthenticationLock = true;
                     CachedAuthentication? authentication = Volatile.Read(ref _authentication);
-                    if (authentication is null || ReferenceEquals(authentication, attemptedAuthentication)
+                    if (borrowedAuthentication || authentication is null || ReferenceEquals(authentication, attemptedAuthentication)
                         || !authentication.Matches(scheme!, authInfo, basicParameters))
                     {
                         if (attemptedAuthentication is not null)
@@ -609,6 +633,7 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
                     }
                     else
                     {
+                        borrowedAuthentication = true;
                         // This exact challenge already has an accepted credential. Its retry
                         // does not need to serialize other requests behind an upload body.
                         _authenticationLock.Release();
