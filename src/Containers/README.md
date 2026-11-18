@@ -14,3 +14,9 @@ Container archive creation and daemon loading download up to four distinct layer
 while writing verified layers in image order. The outer tar records layer-blob entries with
 zero user/group IDs and empty owner names instead of copying host-file ownership. Layer
 contents, their own ownership metadata and OCI descriptors are unchanged.
+
+Publishers sharing the container content store coordinate base-layer downloads within
+and across SDK processes. Completed blobs are verified before reuse. Filesystem leases
+are optional: unavailable locking falls back to independent downloads, and a contended
+cross-process lease waits up to 30 seconds before falling back. Empty `.download.lock`
+files remain in the content store so concurrent publishers keep using the same lock file.

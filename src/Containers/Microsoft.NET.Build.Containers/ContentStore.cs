@@ -1,6 +1,7 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Diagnostics;
 using Microsoft.NET.Build.Containers.Resources;
 
 namespace Microsoft.NET.Build.Containers;
@@ -39,6 +40,57 @@ internal static class ContentStore
 
         string descriptorPath = Path.Combine(ContentRoot, digestValue) + extension;
         return descriptorPath;
+    }
+
+    internal static void CommitBlob(string temporaryPath, string destinationPath, string digest, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporaryPath, destinationPath, overwrite: true);
+        }
+        catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && File.Exists(destinationPath))
+        {
+            // Another publisher may have committed this content while a Windows reader holds it open.
+            // Only accept that winner after verifying the complete content.
+            using FileStream stream = OpenCommittedBlob(destinationPath, cancellationToken);
+            using System.Security.Cryptography.IncrementalHash hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            byte[] buffer = new byte[81920];
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) != 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, read);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            byte[] actual = hash.GetHashAndReset();
+            InvalidDigestException.ThrowIfMismatched(DigestUtils.GetEncodedValue(digest), actual);
+        }
+        finally
+        {
+            File.Delete(temporaryPath);
+        }
+    }
+
+    private static FileStream OpenCommittedBlob(string path, CancellationToken cancellationToken)
+    {
+        long started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return File.OpenRead(path);
+            }
+            catch (IOException error) when (OperatingSystem.IsWindows()
+                && error.HResult == unchecked((int)0x80070020)
+                && Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(1))
+            {
+                // A competing atomic replacement can briefly deny read handles too.
+                // Retry only that sharing violation; a permanently locked file still fails.
+                cancellationToken.WaitHandle.WaitOne(10);
+            }
+        }
     }
 
     public static string GetTempFile() => Path.Join(TempPath, Path.GetRandomFileName());

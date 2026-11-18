@@ -403,34 +403,30 @@ internal sealed class Registry
         cancellationToken.ThrowIfCancellationRequested();
         string localPath = ContentStore.PathForDescriptor(descriptor);
 
-        try
+        if (await TryUseCachedBlobAsync(localPath, descriptor.Digest, cancellationToken).ConfigureAwait(false))
         {
-            using FileStream fileStream = File.OpenRead(localPath);
-
-            byte[] actualHash = await SHA256.HashDataAsync(fileStream, cancellationToken).ConfigureAwait(false);
-            var expectedHash = DigestUtils.GetEncodedValue(descriptor.Digest);
-            InvalidDigestException.ThrowIfMismatched(expectedHash, actualHash);
-
             return localPath;
         }
-        catch (DirectoryNotFoundException)
+
+        using IDisposable lease = await BlobDownloadCoordinator.AcquireAsync(localPath, cancellationToken).ConfigureAwait(false);
+        // A publisher that held the lease may have populated the shared store while
+        // this request waited. Revalidate its bytes before using them.
+        if (await TryUseCachedBlobAsync(localPath, descriptor.Digest, cancellationToken).ConfigureAwait(false))
         {
-            // Cache miss
-        }
-        catch (FileNotFoundException)
-        {
-            // Cache miss
-        }
-        catch (InvalidDigestException exception)
-        {
-            // Incorrect digest
-            _logger.LogTrace(
-                "Digest validation failed for cached blob {1} ({2}), redownloading from registry.",
-                localPath, exception.Message);
+            return localPath;
         }
 
+        return await BlobDownloadCoordinator.CompleteAsync<string>(lease, localPath,
+            token => DownloadAndCommitBlobAsync(repository, descriptor, localPath, token),
+            async token => await TryUseCachedBlobAsync(localPath, descriptor.Digest, token).ConfigureAwait(false) ? localPath : null,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<string> DownloadAndCommitBlobAsync(string repository, Descriptor descriptor, string localPath, CancellationToken cancellationToken)
+    {
         string tempTarballPath = Path.Combine(Path.GetDirectoryName(localPath)!,
             $"{DigestUtils.GetEncoded(descriptor.Digest)}.{Guid.NewGuid():N}.tmp");
+
         try
         {
             int retryCount = 0;
@@ -457,8 +453,7 @@ internal sealed class Registry
                 catch (Exception ex) when ((ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
                     && ex is not InvalidAuthResponseException and not InvalidAuthRealmConfigurationException)
                 {
-                    // HttpClient timeouts also throw OperationCanceledException. They
-                    // remain download failures while the publish token is active.
+                    // HTTP timeouts remain download failures while the caller token is active.
                     retryCount++;
                     if (retryCount >= MaxDownloadRetries)
                     {
@@ -473,7 +468,7 @@ internal sealed class Registry
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            File.Move(tempTarballPath, localPath, overwrite: true);
+            ContentStore.CommitBlob(tempTarballPath, localPath, descriptor.Digest, cancellationToken);
 
             return localPath;
         }
@@ -481,6 +476,37 @@ internal sealed class Registry
         {
             File.Delete(tempTarballPath);
         }
+    }
+
+    private async Task<bool> TryUseCachedBlobAsync(string localPath, string digest, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var fileStream = File.OpenRead(localPath);
+
+            var actualHash = await SHA256.HashDataAsync(fileStream, cancellationToken).ConfigureAwait(false);
+            var expectedHash = DigestUtils.GetEncodedValue(digest);
+            InvalidDigestException.ThrowIfMismatched(expectedHash, actualHash);
+
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Cache miss
+        }
+        catch (FileNotFoundException)
+        {
+            // Cache miss
+        }
+        catch (InvalidDigestException exception)
+        {
+            // Incorrect digest
+            _logger.LogTrace(
+                "Digest validation failed for cached blob {1} ({2}), redownloading from registry.",
+                localPath, exception.Message);
+        }
+
+        return false;
     }
 
     internal async Task PushLayerAsync(Layer layer, string repository, CancellationToken cancellationToken)

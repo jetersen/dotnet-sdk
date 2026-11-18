@@ -1,0 +1,157 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Diagnostics;
+
+namespace Microsoft.NET.Build.Containers;
+
+/// <summary>Coordinates cache misses without sharing registry clients or credentials.</summary>
+internal static class BlobDownloadCoordinator
+{
+    private const int WindowsSharingViolation = unchecked((int)0x80070020);
+    private const int LinuxWouldBlock = 11;
+    private const int MacOSWouldBlock = 35;
+    private static readonly Lock s_sync = new();
+    private static readonly Dictionary<string, Entry> s_entries = new(
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    internal static async ValueTask<IDisposable> AcquireAsync(string path, CancellationToken cancellationToken)
+    {
+        Entry entry;
+        lock (s_sync)
+        {
+            if (!s_entries.TryGetValue(path, out entry!))
+            {
+                entry = new();
+                s_entries.Add(path, entry);
+            }
+            entry.Users++;
+        }
+        bool acquired = false;
+        try
+        {
+            await entry.Semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            acquired = true;
+            ProcessLease processLease = await AcquireProcessLeaseAsync(path, cancellationToken).ConfigureAwait(false);
+            return new Lease(path, entry, processLease.Handle, processLease.TimedOut);
+        }
+        catch
+        {
+            if (acquired)
+            {
+                entry.Semaphore.Release();
+            }
+            RemoveUser(path, entry);
+            throw;
+        }
+    }
+
+    private readonly record struct ProcessLease(FileStream? Handle, bool TimedOut);
+
+    internal static Task<T> CompleteAsync<T>(IDisposable lease, string path,
+        Func<CancellationToken, Task<T>> download, Func<CancellationToken, Task<T?>> readCache,
+        CancellationToken cancellationToken) where T : class
+        => lease is Lease { MonitorCache: true }
+            ? CacheDownloadRace.RunAsync(path, download, readCache, cancellationToken)
+            : download(cancellationToken);
+
+    private static async ValueTask<ProcessLease> AcquireProcessLeaseAsync(string path, CancellationToken cancellationToken)
+    {
+        // Keep the file after release. Unlinking could let waiters lock different inodes.
+        string leasePath = path + ".download.lock";
+        long started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            FileStream? held = null;
+            try
+            {
+                held = OpenLease();
+                try
+                {
+                    // Some Unix filesystems and runtime switches silently disable locking.
+                    // A second open must fail before this is treated as an interprocess lease.
+                    using FileStream probe = OpenLease();
+                    held.Dispose();
+                    return default;
+                }
+                catch (IOException error) when (IsSharingViolation(error))
+                {
+                    return new ProcessLease(held, TimedOut: false);
+                }
+            }
+            catch (IOException error) when (IsSharingViolation(error))
+            {
+                held?.Dispose();
+                // Coordination is optional. Never wait indefinitely for an unresponsive owner.
+                if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromSeconds(30))
+                {
+                    return new ProcessLease(null, TimedOut: true);
+                }
+                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                held?.Dispose();
+                // Download independently; existing digest checks and atomic commits still apply.
+                return default;
+            }
+        }
+
+        FileStream OpenLease()
+        {
+            FileStreamOptions options = new()
+            {
+                Mode = FileMode.OpenOrCreate,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.None,
+                BufferSize = 1
+            };
+            if (!OperatingSystem.IsWindows())
+            {
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            }
+            return new FileStream(leasePath, options);
+        }
+    }
+
+    private static bool IsSharingViolation(IOException error)
+        => error.HResult == (OperatingSystem.IsMacOS() ? MacOSWouldBlock : OperatingSystem.IsWindows() ? WindowsSharingViolation : LinuxWouldBlock);
+
+    private static void RemoveUser(string path, Entry entry)
+    {
+        lock (s_sync)
+        {
+            if (--entry.Users == 0)
+            {
+                s_entries.Remove(path);
+                entry.Semaphore.Dispose();
+            }
+        }
+    }
+
+    private sealed class Entry
+    {
+        internal readonly SemaphoreSlim Semaphore = new(1, 1);
+        internal int Users;
+    }
+
+    private sealed class Lease(string path, Entry entry, FileStream? processLease, bool monitorCache) : IDisposable
+    {
+        internal bool MonitorCache { get; } = monitorCache;
+        private Entry? _entry = entry;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _entry, null) is Entry owned)
+            {
+                try { processLease?.Dispose(); }
+                finally
+                {
+                    owned.Semaphore.Release();
+                    RemoveUser(path, owned);
+                }
+            }
+        }
+    }
+}

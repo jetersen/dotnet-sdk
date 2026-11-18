@@ -56,6 +56,12 @@ feature (`Microsoft.NET.Build.Containers`).
   cleanup before returning. Outer tar blob ownership is normalized; image-layer bytes
   and OCI identities must remain unchanged. See
   [ContainerArchive.cs](Microsoft.NET.Build.Containers/LocalDaemons/ContainerArchive.cs).
+- **Download leases are optional and must not share credentials.** Revalidate a cache
+  winner after taking ownership. Keep lease files on disk: deleting them while publishers
+  hold or wait on their handles can split ownership across inodes. Bounded cross-process
+  waits may fall back to independent downloads; accept a competing winner only after full
+  digest verification and await losing-transfer cleanup. See
+  [BlobDownloadCoordinator.cs](Microsoft.NET.Build.Containers/BlobDownloadCoordinator.cs).
 
 ## Tests
 
