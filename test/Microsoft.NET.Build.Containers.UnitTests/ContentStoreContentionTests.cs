@@ -1,12 +1,50 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Security.Cryptography;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+
 namespace Microsoft.NET.Build.Containers.UnitTests;
 
 [TestClass]
 public class ContentStoreContentionTests
 {
     public TestContext TestContext { get; set; } = default!;
+
+    [TestMethod]
+    [OSCondition(ConditionMode.Include, OperatingSystems.Windows)]
+    public async Task Committed_blob_readers_allow_a_renaming_handle_to_retain_delete_access()
+    {
+        byte[] content = Guid.NewGuid().ToByteArray();
+        Descriptor descriptor = new(SchemaTypes.OciLayerGzipV1,
+            DigestUtils.FormatSha256Digest(Convert.ToHexStringLower(SHA256.HashData(content))), content.Length);
+        string destination = ContentStore.PathForDescriptor(descriptor);
+        string temporary = destination + ".tmp";
+        try
+        {
+            File.WriteAllBytes(temporary, content);
+            // DeleteOnClose requests DELETE access, as a rename handle does. Keep that
+            // handle open after the rename to make the Windows visibility window deterministic.
+            using FileStream renaming = new(temporary, FileMode.Open, FileAccess.Read,
+                FileShare.Read | FileShare.Write | FileShare.Delete, bufferSize: 1, FileOptions.DeleteOnClose);
+            File.Move(temporary, destination);
+            Assert.ThrowsExactly<IOException>(() => { using FileStream denied = File.OpenRead(destination); });
+            using FileStream reader = ContentStore.OpenCommittedBlob(destination, TestContext.CancellationToken);
+            Assert.AreEqual(content.Length, reader.Length);
+            using Stream pushReader = Layer.FromDescriptor(descriptor).OpenBackingFile();
+            Assert.AreEqual(content.Length, pushReader.Length);
+            Mock<IRegistryAPI> api = new(MockBehavior.Strict);
+            string cached = await new Registry("localhost:5000", NullLogger.Instance, api.Object)
+                .DownloadBlobAsync("repo", descriptor, TestContext.CancellationToken);
+            Assert.AreEqual(destination, cached);
+        }
+        finally
+        {
+            File.Delete(temporary);
+            File.Delete(destination);
+        }
+    }
 
     [TestMethod]
     [OSCondition(ConditionMode.Include, OperatingSystems.Windows)]

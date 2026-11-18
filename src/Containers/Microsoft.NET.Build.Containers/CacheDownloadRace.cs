@@ -19,8 +19,8 @@ internal static class CacheDownloadRace
         try
         {
             pending = download(downloadCancellation.Token);
-            if (await Task.WhenAny((Task)pending, cached).ConfigureAwait(false) == cached &&
-                await cached.ConfigureAwait(false) is { } winner && !pending.IsCompleted)
+            await Task.WhenAny((Task)pending, cached).ConfigureAwait(false);
+            if (cached.IsCompletedSuccessfully && cached.Result is { } winner)
             {
                 downloadCancellation.Cancel();
                 await ObserveCompletionAsync(pending).ConfigureAwait(false);
@@ -28,6 +28,13 @@ internal static class CacheDownloadRace
                 return winner;
             }
             return await pending.ConfigureAwait(false);
+        }
+        catch
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Verification can finish while the failed transfer continuation is running.
+            if (cached.IsCompletedSuccessfully && cached.Result is { } winner) return winner;
+            throw;
         }
         finally
         {
@@ -37,6 +44,7 @@ internal static class CacheDownloadRace
             // await its cleanup without replacing that result with a losing exception.
             if (pending is not null) await ObserveCompletionAsync(pending).ConfigureAwait(false);
             await ObserveCompletionAsync(cached).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
         }
     }
 

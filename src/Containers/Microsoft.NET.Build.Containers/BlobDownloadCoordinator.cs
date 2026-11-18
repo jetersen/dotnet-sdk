@@ -60,6 +60,7 @@ internal static class BlobDownloadCoordinator
         // Keep the file after release. Unlinking could let waiters lock different inodes.
         string leasePath = path + ".download.lock";
         long started = Stopwatch.GetTimestamp();
+        int retryDelayMilliseconds = 1;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -67,18 +68,8 @@ internal static class BlobDownloadCoordinator
             try
             {
                 held = OpenLease();
-                try
-                {
-                    // Some Unix filesystems and runtime switches silently disable locking.
-                    // A second open must fail before this is treated as an interprocess lease.
-                    using FileStream probe = OpenLease();
-                    held.Dispose();
-                    return default;
-                }
-                catch (IOException error) when (IsSharingViolation(error))
-                {
-                    return new ProcessLease(held, TimedOut: false);
-                }
+                // Filesystems that do not enforce sharing simply allow independent downloads.
+                return new ProcessLease(held, TimedOut: false);
             }
             catch (IOException error) when (IsSharingViolation(error))
             {
@@ -88,7 +79,10 @@ internal static class BlobDownloadCoordinator
                 {
                     return new ProcessLease(null, TimedOut: true);
                 }
-                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+                // Most local downloads finish quickly; avoid imposing a full 50 ms wait.
+                // Back off to the existing cap when the owner remains busy.
+                await Task.Delay(retryDelayMilliseconds, cancellationToken).ConfigureAwait(false);
+                retryDelayMilliseconds = Math.Min(retryDelayMilliseconds * 2, 50);
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {

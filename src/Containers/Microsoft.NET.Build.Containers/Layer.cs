@@ -257,7 +257,7 @@ internal class Layer
         return (OperatingSystem.IsWindows() || ((file.UnixFileMode & UnixFileMode.UserExecute) != 0)) ? executeMode : nonExecuteMode;
     }
 
-    internal virtual Stream OpenBackingFile() => File.OpenRead(BackingFile);
+    internal virtual Stream OpenBackingFile() => ContentStore.OpenCommittedBlob(BackingFile);
 
     private static readonly char[] PathSeparators = new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
 

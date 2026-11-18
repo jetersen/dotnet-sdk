@@ -80,6 +80,28 @@ public class CacheDownloadRaceTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task An_already_verified_winner_survives_a_completed_transport_failure_unless_cancelled(bool cancel)
+    {
+        string root = Directory.CreateTempSubdirectory().FullName;
+        string path = Path.Combine(root, "candidate");
+        using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        try
+        {
+            await File.WriteAllTextAsync(path, "verified", cancellation.Token);
+            Task<string> result = CacheDownloadRace.RunAsync<string>(path, _ =>
+            {
+                if (cancel) cancellation.Cancel();
+                return Task.FromException<string>(new HttpRequestException("transport failed after verification"));
+            }, _ => Task.FromResult<string?>("verified"), cancellation.Token);
+            if (cancel) await Assert.ThrowsAsync<OperationCanceledException>(() => result);
+            else Assert.AreEqual("verified", await result);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [TestMethod]
     public async Task The_original_transport_error_is_preserved()
     {
         string root = Directory.CreateTempSubdirectory().FullName;

@@ -19,8 +19,6 @@ internal static class ContentStore
         }
     }
 
-    public static string TempPath { get; } = Directory.CreateTempSubdirectory().FullName;
-
     public static string PathForDescriptor(Descriptor descriptor)
     {
         string digestString = descriptor.Digest;
@@ -72,7 +70,7 @@ internal static class ContentStore
         }
     }
 
-    private static FileStream OpenCommittedBlob(string path, CancellationToken cancellationToken)
+    internal static FileStream OpenCommittedBlob(string path, CancellationToken cancellationToken = default, FileOptions options = FileOptions.None)
     {
         long started = Stopwatch.GetTimestamp();
         while (true)
@@ -80,7 +78,8 @@ internal static class ContentStore
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                return File.OpenRead(path);
+                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete,
+                    bufferSize: 4096, options);
             }
             catch (IOException error) when (OperatingSystem.IsWindows()
                 && error.HResult == unchecked((int)0x80070020)
@@ -92,8 +91,6 @@ internal static class ContentStore
             }
         }
     }
-
-    public static string GetTempFile() => Path.Join(TempPath, Path.GetRandomFileName());
 
     /// <summary>
     /// Gets the path to the user cache directory for SDK container builds, creating it if it does

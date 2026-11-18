@@ -212,8 +212,8 @@ internal static class ContainerArchive
             string layerTarballPath = layerPathFunc(descriptor.Digest);
             // Own the input stream so a failed/cancelled tar write always closes it.
             // TarWriter's file-path overload in the pinned runtime disposes only on success.
-            await using FileStream layerStream = new(localPath, FileMode.Open, FileAccess.Read,
-                FileShare.Read, bufferSize: 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await using FileStream layerStream = ContentStore.OpenCommittedBlob(localPath, cancellationToken,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
             DateTimeOffset modificationTime = File.GetLastWriteTimeUtc(localPath);
             PaxTarEntry layerEntry = new(TarEntryType.RegularFile, layerTarballPath)
             {

@@ -482,7 +482,7 @@ internal sealed class Registry
     {
         try
         {
-            using var fileStream = File.OpenRead(localPath);
+            using FileStream fileStream = ContentStore.OpenCommittedBlob(localPath, cancellationToken);
 
             var actualHash = await SHA256.HashDataAsync(fileStream, cancellationToken).ConfigureAwait(false);
             var expectedHash = DigestUtils.GetEncodedValue(digest);
