@@ -242,7 +242,9 @@ internal sealed class Registry
         ManifestConfig config = manifest.Config;
         string configSha = config.digest;
 
-        JsonNode configDoc = await _registryAPI.Blob.GetJsonAsync(repositoryName, configSha, cancellationToken).ConfigureAwait(false);
+        // Resolve the manifest/tag on every request; cache only the immutable configuration digest.
+        JsonNode configDoc = await ConfigurationBlobCache.GetAsync(configSha,
+            token => _registryAPI.Blob.GetContentAsync(repositoryName, configSha, token), cancellationToken).ConfigureAwait(false);
 
         cancellationToken.ThrowIfCancellationRequested();
         // ManifestV2.MediaType can be null, so we also provide manifest mediaType from http response

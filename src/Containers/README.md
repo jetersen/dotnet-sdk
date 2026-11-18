@@ -24,3 +24,7 @@ Empty `.download.lock` files remain in the content store so concurrent publisher
 Application layers are written to temporary files beside their content-store destination
 and committed atomically. A concurrent reader does not prevent reusing an identical,
 fully verified layer committed by another publisher.
+
+Base-image configuration blobs are reused by their verified content digest. Mutable tags
+and platform manifests are still resolved on every request. Each image receives an
+independently parsed configuration; unavailable cache storage does not prevent fetching it.

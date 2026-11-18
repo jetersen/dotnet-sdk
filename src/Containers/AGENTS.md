@@ -63,6 +63,11 @@ feature (`Microsoft.NET.Build.Containers`).
   digest verification and await losing-transfer cleanup. See
   [BlobDownloadCoordinator.cs](Microsoft.NET.Build.Containers/BlobDownloadCoordinator.cs).
 
+- **Cache base configurations by verified digest, never by tag.** Resolve the current
+  manifest before looking up its configuration. Parse a fresh document for each image,
+  preserve transport failures and cancellation, and treat cache writes as optional. See
+  [ConfigurationBlobCache.cs](Microsoft.NET.Build.Containers/Registry/ConfigurationBlobCache.cs).
+
 ## Tests
 
 - Unit: `test/Microsoft.NET.Build.Containers.UnitTests` (MSTest) — run everywhere.

@@ -59,7 +59,7 @@ internal class DefaultBlobOperations : IBlobOperations
         return await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<ReadOnlyMemory<byte>> GetContentAsync(string repositoryName, string digest, CancellationToken cancellationToken)
+    public async Task<ReadOnlyMemory<byte>> GetContentAsync(string repositoryName, string digest, CancellationToken cancellationToken)
     {
         using HttpResponseMessage response = await GetResponseAsync(repositoryName, digest, cancellationToken).ConfigureAwait(false);
         ReadOnlyMemory<byte> content = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);

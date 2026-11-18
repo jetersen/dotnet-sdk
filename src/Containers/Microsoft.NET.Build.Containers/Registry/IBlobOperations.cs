@@ -17,6 +17,8 @@ internal interface IBlobOperations
 
     public Task<bool> ExistsAsync(string repositoryName, string digest, CancellationToken cancellationToken);
 
+    public Task<ReadOnlyMemory<byte>> GetContentAsync(string repositoryName, string digest, CancellationToken cancellationToken);
+
     public Task<JsonNode> GetJsonAsync(string repositoryName, string digest, CancellationToken cancellationToken);
 
     /// <summary>
