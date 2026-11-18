@@ -13,6 +13,71 @@ public class MultiArchArchiveIncrementalTests : SdkTest
 {
     [TestMethod]
     [OSCondition(ConditionMode.Include, OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Archive_cache_tracks_inner_destination_names(bool useMultithreading)
+    {
+        await using ContainerTestRegistry registry = new();
+        var asset = TestAssetsManager.CopyTestAsset("HelloWorld", identifier: useMultithreading.ToString()).WithSource();
+        string archive = Path.Combine(asset.TestRoot, "images.tar");
+        string cache = Directory.CreateDirectory(Path.Combine(asset.TestRoot, "cache")).FullName;
+        asset.WithProjectChanges(project => project.Root!.Add(
+            new XElement("PropertyGroup", new XAttribute("Condition", "'$(RuntimeIdentifier)' == ''"),
+                new XElement("ContainerArchiveOutputPath", archive)),
+            new XElement("Target", new XAttribute("Name", "RecordContainerNames"),
+                new XAttribute("AfterTargets", "_PublishSingleContainer"),
+                new XElement("WriteLinesToFile", new XAttribute("File", "$(MSBuildProjectDirectory)/names-$(RuntimeIdentifier).txt"),
+                    new XAttribute("Lines", "@(GeneratedContainerName)"), new XAttribute("Overwrite", "true")))));
+        string[] arguments = [
+            "publish", "-t:PublishContainer", "-v:normal", $"-mt:{useMultithreading}",
+            "-p:EnableSdkContainerSupport=true", "-p:UseAppHost=false", "-p:SelfContained=false",
+            "-p:RuntimeIdentifiers=\"linux-x64;linux-arm64\"",
+            $"-p:ContainerBaseImage={registry.Address}/empty:latest", $"-p:ContainerRegistry={registry.Address}",
+            "-p:ContainerRepository=names-test", "-p:ContainerImageTag=test"
+        ];
+        Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}"]).Should().Pass();
+        Assert.AreSequenceEqual(new[] { "names-test:test", "names-test:test" }, ReadNames());
+
+        var changed = Publish(arguments);
+        changed.Should().Pass();
+        Assert.Contains("for runtime identifier", changed.StdOut!);
+        string[] remoteNames = ReadNames();
+        Assert.AreSequenceEqual(new[] { $"{registry.Address}:names-test:test", $"{registry.Address}:names-test:test" }, remoteNames);
+        var warm = Publish(arguments);
+        warm.Should().Pass();
+        Assert.DoesNotContain("for runtime identifier", warm.StdOut!);
+        Assert.AreSequenceEqual(remoteNames, ReadNames());
+        Publish([.. arguments, "-p:ContainerArchiveNoIncremental=true"]).Should().Pass();
+        Assert.AreSequenceEqual(remoteNames, ReadNames());
+
+        var local = Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}"]);
+        local.Should().Pass();
+        Assert.Contains("for runtime identifier", local.StdOut!);
+        string[] localNames = ReadNames();
+        Assert.AreSequenceEqual(new[] { "names-test:test", "names-test:test" }, localNames);
+        var warmLocal = Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}"]);
+        warmLocal.Should().Pass();
+        Assert.DoesNotContain("for runtime identifier", warmLocal.StdOut!);
+        Assert.AreSequenceEqual(localNames, ReadNames());
+        Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}", "-p:ContainerArchiveNoIncremental=true"]).Should().Pass();
+        Assert.AreSequenceEqual(localNames, ReadNames());
+
+        string[] ReadNames() => new[] { "linux-x64", "linux-arm64" }
+            .Select(rid => File.ReadAllText(Path.Combine(asset.TestRoot, $"names-{rid}.txt")).Trim()).ToArray();
+
+        Microsoft.DotNet.Cli.Utils.CommandResult Publish(string[] args)
+            => new DotnetCommand(Log, args)
+                .WithWorkingDirectory(asset.TestRoot)
+                .WithEnvironmentVariable("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "0")
+                .WithEnvironmentVariable("DOTNET_CONTAINER_INSECURE_REGISTRIES", registry.Address)
+                .WithEnvironmentVariable("SOURCE_DATE_EPOCH", "1700000000")
+                .WithEnvironmentVariable("XDG_CACHE_HOME", cache)
+                .WithEnvironmentVariable("HOME", cache)
+                .Execute();
+    }
+
+    [TestMethod]
+    [OSCondition(ConditionMode.Include, OperatingSystems.Linux | OperatingSystems.OSX)]
     [DataRow(false, false, false)]
     [DataRow(true, false, false)]
     [DataRow(false, true, false)]

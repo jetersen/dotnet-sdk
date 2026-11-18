@@ -47,6 +47,11 @@ internal static class ContainerArchiveCache
             AppendLabels(hash, task.Labels);
         }
         Append(hash, task.SkipPublishing.ToString());
+        if (task.SkipPublishing)
+        {
+            // The destination changes the generated names even when no image is pushed.
+            Append(hash, string.IsNullOrEmpty(task.ArchiveOutputPath) ? task.OutputRegistry ?? string.Empty : string.Empty);
+        }
         Append(hash, "ImageTags", task.ImageTags);
         Append(hash, "Entrypoint", task.Entrypoint);
         Append(hash, "EntrypointArgs", task.EntrypointArgs);

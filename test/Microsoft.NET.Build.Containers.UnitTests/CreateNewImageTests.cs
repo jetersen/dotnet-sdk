@@ -122,6 +122,31 @@ public class CreateNewImageTests
     }
 
     [TestMethod]
+    public void Inner_archive_fingerprint_tracks_the_effective_destination_registry()
+    {
+        string directory = CreateTempDirectory();
+        try
+        {
+            CreateNewImage task = CreateIncrementalTask(directory);
+            task.SkipPublishing = true;
+            task.OutputRegistry = "first.example";
+            task.ArchiveOutputPath = "image.tar";
+            string local = ComputeResolvedFingerprint(task);
+            task.ArchiveOutputPath = string.Empty;
+            string firstRegistry = ComputeResolvedFingerprint(task);
+            Assert.AreNotEqual(local, firstRegistry);
+            task.OutputRegistry = "second.example";
+            Assert.AreNotEqual(firstRegistry, ComputeResolvedFingerprint(task));
+            task.ArchiveOutputPath = "another.tar";
+            Assert.AreEqual(local, ComputeResolvedFingerprint(task));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public void ArchiveIncrementalFingerprintTracksInputs()
     {
         string publishDirectory = CreateTempDirectory();
