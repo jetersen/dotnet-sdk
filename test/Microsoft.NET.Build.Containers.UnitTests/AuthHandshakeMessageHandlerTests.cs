@@ -26,6 +26,54 @@ namespace Microsoft.NET.Build.Containers.UnitTests
         private const string RequestUrl = $"https://{TestRegistryName}/v2";
         private const string BearerRealmUrl = $"https://bearer.test/token";
 
+        [TestMethod]
+        public async Task Challenge_body_is_discarded_without_buffering_before_authentication()
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                DiscardedChallengeContent content = new();
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new ServerMessageHandler(request =>
+                    {
+                        if (request.Headers.Authorization is not null) return new HttpResponseMessage(HttpStatusCode.OK);
+                        HttpResponseMessage challenge = CreateRequestAuthenticateResponse("Basic", "");
+                        challenge.Content = content;
+                        return challenge;
+                    }), NullLogger.Instance, RegistryMode.Pull));
+                using HttpResponseMessage response = await client.GetAsync(RequestUrl, TestContext.CancellationToken);
+                Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+                Assert.IsLessThan(8192, content.MaximumBufferedBytes);
+                Assert.AreEqual(512 * 1024, content.BytesDiscarded);
+            });
+        }
+
+        private sealed class DiscardedChallengeContent : HttpContent
+        {
+            internal long MaximumBufferedBytes { get; private set; }
+            internal int BytesDiscarded { get; private set; }
+
+            protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+                => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+            protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
+            {
+                byte[] chunk = new byte[8192];
+                for (int i = 0; i < 64; i++)
+                {
+                    await stream.WriteAsync(chunk, cancellationToken);
+                    BytesDiscarded += chunk.Length;
+                    if (stream.CanSeek) MaximumBufferedBytes = Math.Max(MaximumBufferedBytes, stream.Length);
+                }
+            }
+
+            protected override bool TryComputeLength(out long length)
+            {
+                length = 0;
+                return false;
+            }
+        }
+
         /// <summary>
         /// Verifies that each registry mode reads its supported credential environment
         /// variables, restoring the caller's environment after the scenario.
@@ -2346,10 +2394,10 @@ namespace Microsoft.NET.Build.Containers.UnitTests
 
         /// <summary>
         /// Starts overlapping unauthenticated requests and verifies that they can each
-        /// complete a handshake through an independently owned realm transport.
+        /// reuse one accepted handshake without duplicate token requests.
         /// </summary>
         [TestMethod]
-        public async Task ConcurrentChallengesAuthenticateIndependentlyOverSharedTransport()
+        public async Task ConcurrentChallengesShareOneAcceptedAuthentication()
         {
             // Gate every initial request so none can populate the cache before the others reach the registry.
             const int RequestCount = 8;
@@ -2412,10 +2460,10 @@ namespace Microsoft.NET.Build.Containers.UnitTests
 
                 try
                 {
-                    // Each overlapping challenge gets its own disposable realm transport.
+                    // Requests share accepted authentication and still own their responses.
                     Assert.ContainsOnly(response => response.StatusCode == HttpStatusCode.OK, responses);
-                    Assert.AreEqual(RequestCount, authenticationHandlerCount);
-                    Assert.AreEqual(RequestCount, authenticationRequestCount);
+                    Assert.AreEqual(1, authenticationHandlerCount);
+                    Assert.AreEqual(1, authenticationRequestCount);
                 }
                 finally
                 {
@@ -2431,6 +2479,156 @@ namespace Microsoft.NET.Build.Containers.UnitTests
                 Environment.SetEnvironmentVariable(ContainerHelpers.PullHostObjectUser, originalUsername);
                 Environment.SetEnvironmentVariable(ContainerHelpers.PullHostObjectPass, originalPassword);
             }
+        }
+
+        [TestMethod]
+        [DataRow("scope", false)]
+        [DataRow("scope", true)]
+        [DataRow("realm", true)]
+        [DataRow("service", true)]
+        public async Task ConcurrentChallengesDoNotShareAuthenticationAcrossDifferentChallenges(string difference, bool expireToken)
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                var pushArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var pullAccepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                int generation = 0;
+                bool racing = false;
+                int tokens = 0;
+
+                (string Realm, string Service, string Scope) Challenge(bool push) => (
+                    difference == "realm" && push ? "https://push.test/token" : "https://auth.test/token",
+                    difference == "service" && push ? "push-service" : "registry-service",
+                    difference == "scope" && push ? "repository:app:pull,push" : "repository:app:pull");
+                string Token(string realm, string service, string scope) => $"{generation}|{realm}|{service}|{scope}";
+
+                async Task<HttpResponseMessage> RegistryServer(HttpRequestMessage request, CancellationToken token)
+                {
+                    bool push = request.Method != HttpMethod.Head;
+                    var challenge = Challenge(push);
+                    if (request.Headers.Authorization?.Parameter == Token(challenge.Realm, challenge.Service, challenge.Scope))
+                    {
+                        if (racing && !push) pullAccepted.TrySetResult();
+                        return new HttpResponseMessage(push ? HttpStatusCode.Created : HttpStatusCode.OK);
+                    }
+                    if (racing)
+                    {
+                        if (push)
+                        {
+                            pushArrived.TrySetResult();
+                            await pullAccepted.Task.WaitAsync(token);
+                        }
+                        else
+                        {
+                            await pushArrived.Task.WaitAsync(token);
+                        }
+                    }
+                    return CreateRequestAuthenticateResponse("Bearer",
+                        $"realm=\"{challenge.Realm}\",service=\"{challenge.Service}\",scope=\"{challenge.Scope}\"");
+                }
+
+                using var client = new HttpClient(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false, new AsyncServerMessageHandler(RegistryServer),
+                    NullLogger.Instance, RegistryMode.Push,
+                    realmHandlerFactory: _ => new ServerMessageHandler(request =>
+                    {
+                        Interlocked.Increment(ref tokens);
+                        var query = HttpUtility.ParseQueryString(request.RequestUri!.Query);
+                        string realm = request.RequestUri.GetLeftPart(UriPartial.Path);
+                        return CreateBearerTokenResponse(Token(realm, query["service"]!, query["scope"]!));
+                    })));
+                if (expireToken)
+                {
+                    using var warm = await client.PostAsync(RequestUrl, null, timeout.Token);
+                    Assert.AreEqual(HttpStatusCode.Created, warm.StatusCode);
+                    generation++;
+                }
+                racing = true;
+                Task<HttpResponseMessage> head = client.SendAsync(new HttpRequestMessage(HttpMethod.Head, RequestUrl), timeout.Token);
+                Task<HttpResponseMessage> put = client.PutAsync(RequestUrl, null, timeout.Token);
+                HttpResponseMessage[] replies = await Task.WhenAll(head, put);
+                try
+                {
+                    Assert.AreEqual(HttpStatusCode.OK, replies[0].StatusCode);
+                    Assert.AreEqual(HttpStatusCode.Created, replies[1].StatusCode);
+                    Assert.AreEqual(expireToken ? 3 : 2, tokens);
+                }
+                finally
+                {
+                    foreach (var reply in replies) reply.Dispose();
+                }
+            });
+        }
+
+        [TestMethod]
+        [DataRow("owner-failure")]
+        [DataRow("owner-cancel")]
+        [DataRow("waiter-cancel")]
+        public async Task Authentication_failure_and_cancellation_do_not_poison_other_requests(string failure)
+        {
+            await WithRegistryCredentialsAsync(TestRegistryName, async () =>
+            {
+                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                using CancellationTokenSource ownerCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                using CancellationTokenSource waiterCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                TaskCompletionSource ownerStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource waiterChallenged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource releaseOwner = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                int tokens = 0;
+
+                using HttpClient client = new(new AuthHandshakeMessageHandler(
+                    TestRegistryName, new Uri(RequestUrl), false,
+                    new ServerMessageHandler(request =>
+                    {
+                        if (request.Headers.Authorization?.Parameter == "accepted") return new HttpResponseMessage(HttpStatusCode.OK);
+                        if (request.RequestUri!.AbsolutePath.EndsWith("/waiter", StringComparison.Ordinal)) waiterChallenged.TrySetResult();
+                        return CreateRequestAuthenticateResponse("Bearer", $"realm=\"{BearerRealmUrl}\"");
+                    }), NullLogger.Instance, RegistryMode.Pull,
+                    realmHandlerFactory: _ => new AsyncServerMessageHandler(async (_, cancellationToken) =>
+                    {
+                        if (Interlocked.Increment(ref tokens) == 1)
+                        {
+                            ownerStarted.TrySetResult();
+                            await releaseOwner.Task.WaitAsync(cancellationToken);
+                            if (failure == "owner-failure") throw new InvalidOperationException("token acquisition failed");
+                        }
+                        return CreateBearerTokenResponse("accepted");
+                    })));
+
+                Task<HttpResponseMessage> owner = client.GetAsync(RequestUrl, ownerCancellation.Token);
+                await ownerStarted.Task.WaitAsync(timeout.Token);
+                Task<HttpResponseMessage> waiter = client.GetAsync(RequestUrl + "/waiter", waiterCancellation.Token);
+                await waiterChallenged.Task.WaitAsync(timeout.Token);
+                if (failure == "waiter-cancel")
+                {
+                    waiterCancellation.Cancel();
+                    await Assert.ThrowsAsync<OperationCanceledException>(() => waiter);
+                    releaseOwner.TrySetResult();
+                    using HttpResponseMessage accepted = await owner;
+                    Assert.AreEqual(HttpStatusCode.OK, accepted.StatusCode);
+                }
+                else
+                {
+                    if (failure == "owner-cancel")
+                    {
+                        ownerCancellation.Cancel();
+                        await Assert.ThrowsAsync<OperationCanceledException>(() => owner);
+                    }
+                    else
+                    {
+                        releaseOwner.TrySetResult();
+                        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => owner);
+                    }
+                    using HttpResponseMessage accepted = await waiter;
+                    Assert.AreEqual(HttpStatusCode.OK, accepted.StatusCode);
+                }
+                using HttpResponseMessage recovered = await client.GetAsync(RequestUrl, timeout.Token);
+                Assert.AreEqual(HttpStatusCode.OK, recovered.StatusCode);
+                Assert.AreEqual(failure == "waiter-cancel" ? 1 : 2, tokens);
+            });
         }
 
         /// <summary>

@@ -42,6 +42,11 @@ feature (`Microsoft.NET.Build.Containers`).
   [AuthHandshakeMessageHandler.cs](Microsoft.NET.Build.Containers/AuthHandshakeMessageHandler.cs)
   allows one completed authentication acquisition per request; transport failures before
   acquisition remain retryable within the existing retry budget.
+- **Share authentication only for the same challenge.** Match scheme, realm, service,
+  scope and Basic parameters before reusing a concurrently accepted credential. Keep
+  acquisition and its first validated response together; release the lock before a retry
+  that reuses accepted authentication. Cancellation or failure must release acquisition
+  ownership without cancelling sibling requests.
 
 ## Tests
 

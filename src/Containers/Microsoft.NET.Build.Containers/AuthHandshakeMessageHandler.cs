@@ -44,7 +44,14 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
     private readonly RegistryMode _registryMode;
     private readonly Func<Uri, HttpMessageHandler> _createRealmHandler;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
-    private AuthenticationHeaderValue? _authentication;
+    private sealed record CachedAuthentication(AuthenticationHeaderValue Header, string Scheme, AuthInfo? Info, string? BasicParameters)
+    {
+        internal bool Matches(string scheme, AuthInfo? info, string? basicParameters)
+            => Scheme.Equals(scheme, StringComparison.OrdinalIgnoreCase) && Info == info && BasicParameters == basicParameters;
+    }
+
+    private CachedAuthentication? _authentication;
+    private readonly SemaphoreSlim _authenticationLock = new(1, 1);
 
     public AuthHandshakeMessageHandler(
         string registryName,
@@ -514,97 +521,133 @@ internal sealed partial class AuthHandshakeMessageHandler : DelegatingHandler
         }
 
         bool isRegistryOrigin = IsRegistryOrigin(request.RequestUri);
-        AuthenticationHeaderValue? attemptedAuthentication = isRegistryOrigin ? Volatile.Read(ref _authentication) : null;
+        CachedAuthentication? attemptedAuthentication = isRegistryOrigin ? Volatile.Read(ref _authentication) : null;
         if (attemptedAuthentication is not null)
         {
-            request.Headers.Authorization = attemptedAuthentication;
+            request.Headers.Authorization = attemptedAuthentication.Header;
         }
 
         int retryCount = 0;
         List<Exception>? requestExceptions = null;
-        AuthenticationHeaderValue? authenticationToCache = null;
+        CachedAuthentication? authenticationToCache = null;
 
-        while (retryCount < MaxRequestRetries)
+        bool acquiredAuthentication = false;
+        bool ownsAuthenticationLock = false;
+        try
         {
-            try
+            while (retryCount < MaxRequestRetries)
             {
-                // Redirects mutate the request URI and clear Authorization, including for same-origin redirects.
-                // Restore only the existing credential, and only while retrying the registry itself.
-                if (retryCount > 0 && IsRegistryOrigin(request.RequestUri)
-                    && (authenticationToCache ?? attemptedAuthentication) is { } retryAuthentication)
-                {
-                    request.Headers.Authorization = retryAuthentication;
-                }
-
-                var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                ValidateAuthenticationOrigin(response, request.RequestUri);
-                if (authenticationToCache is not null && response.StatusCode != HttpStatusCode.Unauthorized)
-                {
-                    Interlocked.Exchange(ref _authentication, authenticationToCache);
-                }
-
-                if (response.StatusCode != HttpStatusCode.Unauthorized
-                    || !isRegistryOrigin
-                    || authenticationToCache is not null)
-                {
-                    return response;
-                }
-
-                string? scheme;
-                AuthInfo? authInfo;
-                bool challengeParsed;
                 try
                 {
-                    challengeParsed = TryParseAuthenticationInfo(response, out scheme, out authInfo);
-                }
-                catch
-                {
-                    response.Dispose();
-                    throw;
-                }
+                    // Redirects mutate the request URI and clear Authorization, including for same-origin redirects.
+                    // Restore only the existing credential, and only while retrying the registry itself.
+                    if (retryCount > 0 && IsRegistryOrigin(request.RequestUri)
+                        && (authenticationToCache ?? attemptedAuthentication) is { } retryAuthentication)
+                    {
+                        request.Headers.Authorization = retryAuthentication.Header;
+                    }
 
-                if (!challengeParsed)
-                {
-                    return response;
-                }
+                    var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                    ValidateAuthenticationOrigin(response, request.RequestUri);
+                    if (acquiredAuthentication && authenticationToCache is not null && response.StatusCode != HttpStatusCode.Unauthorized)
+                    {
+                        Interlocked.Exchange(ref _authentication, authenticationToCache);
+                    }
 
-                using (response)
-                {
-                    // Load the reply so the HTTP connection becomes available to send the authentication request.
-                    // Ideally we'd call LoadIntoBufferAsync, but it has no overload that accepts a CancellationToken so we call ReadAsByteArrayAsync instead.
-                    _ = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
-                }
+                    if (response.StatusCode != HttpStatusCode.Unauthorized
+                        || !isRegistryOrigin
+                        || authenticationToCache is not null)
+                    {
+                        return response;
+                    }
 
-                if (attemptedAuthentication is not null)
-                {
-                    Interlocked.CompareExchange(ref _authentication, null, attemptedAuthentication);
-                }
+                    string? scheme;
+                    AuthInfo? authInfo;
+                    bool challengeParsed;
+                    try
+                    {
+                        challengeParsed = TryParseAuthenticationInfo(response, out scheme, out authInfo);
+                    }
+                    catch
+                    {
+                        response.Dispose();
+                        throw;
+                    }
 
-                if (await GetAuthenticationAsync(_registryName, scheme!, authInfo, cancellationToken).ConfigureAwait(false) is not (AuthenticationHeaderValue authHeader, _))
-                {
-                    throw new UnableToAccessRepositoryException(_registryName);
-                }
+                    if (!challengeParsed)
+                    {
+                        return response;
+                    }
 
-                authenticationToCache = authHeader;
-                request.Headers.Authorization = authHeader;
-                continue;
+                    string? basicParameters = authInfo is null ? response.Headers.WwwAuthenticate.First().Parameter : null;
+                    using (response)
+                    {
+                        // Drain the challenge so the connection can be reused for authentication.
+                        // Discard it incrementally instead of buffering one body per cold blob request.
+                        await response.Content.CopyToAsync(Stream.Null, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    // Keep the acquisition and its first validated registry response together.
+                    // Other cold blob requests can then reuse a proven credential without
+                    // launching duplicate helpers or caching credentials from a rejected origin.
+                    await _authenticationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    ownsAuthenticationLock = true;
+                    CachedAuthentication? authentication = Volatile.Read(ref _authentication);
+                    if (authentication is null || ReferenceEquals(authentication, attemptedAuthentication)
+                        || !authentication.Matches(scheme!, authInfo, basicParameters))
+                    {
+                        if (attemptedAuthentication is not null)
+                        {
+                            Interlocked.CompareExchange(ref _authentication, null, attemptedAuthentication);
+                        }
+                        if (await GetAuthenticationAsync(_registryName, scheme!, authInfo, cancellationToken).ConfigureAwait(false) is not (AuthenticationHeaderValue acquired, _))
+                        {
+                            throw new UnableToAccessRepositoryException(_registryName);
+                        }
+                        authentication = new CachedAuthentication(acquired, scheme!, authInfo, basicParameters);
+                        acquiredAuthentication = true;
+                    }
+                    else
+                    {
+                        // This exact challenge already has an accepted credential. Its retry
+                        // does not need to serialize other requests behind an upload body.
+                        _authenticationLock.Release();
+                        ownsAuthenticationLock = false;
+                    }
+
+                    authenticationToCache = authentication;
+                    request.Headers.Authorization = authentication.Header;
+                    continue;
+                }
+                catch (HttpRequestException e) when (e.InnerException is IOException ioe && ioe.InnerException is SocketException se)
+                {
+                    if (ownsAuthenticationLock)
+                    {
+                        _authenticationLock.Release();
+                        ownsAuthenticationLock = false;
+                    }
+                    requestExceptions ??= new();
+                    requestExceptions.Add(e);
+
+                    retryCount += 1;
+                    _logger.LogInformation("Encountered a HttpRequestException {error} with message \"{message}\". Pausing before retry.", e.HttpRequestError, se.Message);
+                    _logger.LogTrace("Exception details: {ex}", se);
+                    await _delay(TimeSpan.FromSeconds(1.0 * Math.Pow(2, retryCount)), cancellationToken).ConfigureAwait(false);
+
+                    // retry
+                    continue;
+                }
             }
-            catch (HttpRequestException e) when (e.InnerException is IOException ioe && ioe.InnerException is SocketException se)
+
+            throw new ApplicationException(Resource.GetString(nameof(Strings.TooManyRetries)), new AggregateException(requestExceptions!));
+        }
+        finally
+        {
+            if (ownsAuthenticationLock)
             {
-                requestExceptions ??= new();
-                requestExceptions.Add(e);
-
-                retryCount += 1;
-                _logger.LogInformation("Encountered a HttpRequestException {error} with message \"{message}\". Pausing before retry.", e.HttpRequestError, se.Message);
-                _logger.LogTrace("Exception details: {ex}", se);
-                await _delay(TimeSpan.FromSeconds(1.0 * Math.Pow(2, retryCount)), cancellationToken).ConfigureAwait(false);
-
-                // retry
-                continue;
+                _authenticationLock.Release();
             }
         }
-
-        throw new ApplicationException(Resource.GetString(nameof(Strings.TooManyRetries)), new AggregateException(requestExceptions!));
     }
 
     [GeneratedRegex("(?<key>\\w+)=\"(?<value>[^\"]*)\"(?:,|$)")]
