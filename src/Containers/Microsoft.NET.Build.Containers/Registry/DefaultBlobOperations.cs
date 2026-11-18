@@ -1,9 +1,7 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Diagnostics;
 using System.Net;
-using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
 using Microsoft.NET.Build.Containers.Resources;
 
@@ -38,17 +36,6 @@ internal class DefaultBlobOperations : IBlobOperations
             HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => throw new UnableToAccessRepositoryException(_registryName, repositoryName),
             _ => await LogAndThrowContainerHttpException<bool>(response, cancellationToken).ConfigureAwait(false)
         };
-    }
-
-    public async Task<JsonNode> GetJsonAsync(string repositoryName, string digest, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        ReadOnlyMemory<byte> content = await GetContentAsync(repositoryName, digest, cancellationToken).ConfigureAwait(false);
-
-        JsonNode? configDoc = JsonNode.Parse(content.Span);
-        Debug.Assert(configDoc is not null);
-
-        return configDoc;
     }
 
     public async Task<Stream> GetUnvalidatedStreamAsync(string repositoryName, string digest, CancellationToken cancellationToken)

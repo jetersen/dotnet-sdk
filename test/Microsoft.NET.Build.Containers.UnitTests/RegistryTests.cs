@@ -839,21 +839,12 @@ public class RegistryTests : IDisposable
     }
 
     [TestMethod]
-    public async Task GetJsonAsync_ThrowsWhenContentDoesNotMatchDeclaredDigest()
+    public async Task GetContentAsync_ThrowsWhenContentDoesNotMatchDeclaredDigest()
     {
-        // Arrange: DefaultBlobOperations.GetJsonAsync fetches a blob (e.g. the image config
-        // referenced by a manifest) by digest and hands back a parsed JsonNode. Layer blobs are
-        // verified via StreamExtensions.CopyToAndVerifyAsync when downloaded; config/blob JSON
-        // content fetched this way should receive the same treatment -- it must be hashed and
-        // compared against the digest it was requested by. A compromised or MITM registry could
-        // otherwise serve different content for the same digest without detection.
-        //
-        // Note: this is tested directly against DefaultBlobOperations (rather than through
-        // Registry.GetImageManifestAsync via a mocked IRegistryAPI) because the digest
-        // verification must happen here, where the raw response bytes are still available --
-        // IBlobOperations.GetJsonAsync is the boundary where they get discarded in favor of a
-        // parsed JsonNode.
-        ILogger logger = _loggerFactory.CreateLogger(nameof(GetJsonAsync_ThrowsWhenContentDoesNotMatchDeclaredDigest));
+        // The raw blob transport must verify its bytes before returning them to the
+        // configuration cache or parser. Exercise the real HTTP boundary so a mocked
+        // IRegistryAPI cannot bypass verification in this regression.
+        ILogger logger = _loggerFactory.CreateLogger(nameof(GetContentAsync_ThrowsWhenContentDoesNotMatchDeclaredDigest));
         var repoName = "testRepo";
         string configDigest = "sha256:" + new string('c', 64);
         Uri baseUri = new("https://my-registry.example.com");
@@ -870,7 +861,7 @@ public class RegistryTests : IDisposable
         // Act & Assert: fetching the config blob should fail digest verification because the
         // declared digest does not match the content actually received.
         await Assert.ThrowsExactlyAsync<InvalidDigestException>(() =>
-            blobOperations.GetJsonAsync(repoName, configDigest, cancellationToken: default));
+            blobOperations.GetContentAsync(repoName, configDigest, cancellationToken: default));
     }
 
     /// <summary>

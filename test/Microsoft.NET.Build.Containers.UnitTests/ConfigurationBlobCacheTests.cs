@@ -12,6 +12,17 @@ public class ConfigurationBlobCacheTests
     public ConfigurationBlobCacheTests(TestContext testContext) => TestContext = testContext;
 
     [TestMethod]
+    public async Task A_cache_read_parses_only_the_verified_snapshot()
+    {
+        byte[] verified = """{"value":1}"""u8.ToArray();
+        byte[] changed = """{"value":2}"""u8.ToArray();
+        using Stream source = new RewrittenOnRewindStream(verified, changed);
+        JsonNode? document = await ConfigurationBlobCache.ReadVerifiedAsync(source,
+            DigestUtils.ComputeSha256Digest("""{"value":1}"""), TestContext.CancellationToken);
+        Assert.AreEqual(1, document!["value"]!.GetValue<int>());
+    }
+
+    [TestMethod]
     public async Task Configuration_is_verified_repaired_and_parsed_independently()
     {
         string root = Directory.CreateTempSubdirectory().FullName;
@@ -183,5 +194,22 @@ public class ConfigurationBlobCacheTests
             }
         }
         finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private sealed class RewrittenOnRewindStream(byte[] original, byte[] changed) : MemoryStream(original, writable: true)
+    {
+        public override long Position
+        {
+            get => base.Position;
+            set
+            {
+                if (value == 0 && base.Position > 0)
+                {
+                    base.Position = 0;
+                    base.Write(changed);
+                }
+                base.Position = value;
+            }
+        }
     }
 }

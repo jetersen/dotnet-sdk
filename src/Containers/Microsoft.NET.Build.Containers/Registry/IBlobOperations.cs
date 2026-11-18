@@ -1,8 +1,6 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Text.Json.Nodes;
-
 namespace Microsoft.NET.Build.Containers;
 
 /// <summary>
@@ -18,8 +16,6 @@ internal interface IBlobOperations
     public Task<bool> ExistsAsync(string repositoryName, string digest, CancellationToken cancellationToken);
 
     public Task<ReadOnlyMemory<byte>> GetContentAsync(string repositoryName, string digest, CancellationToken cancellationToken);
-
-    public Task<JsonNode> GetJsonAsync(string repositoryName, string digest, CancellationToken cancellationToken);
 
     /// <summary>
     /// Fetches the blob for <paramref name="digest"/> as a stream.

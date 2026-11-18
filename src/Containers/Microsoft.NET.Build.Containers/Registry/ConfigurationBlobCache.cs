@@ -2,7 +2,6 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
-using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -35,7 +34,6 @@ internal static class ConfigurationBlobCache
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        DigestUtils.ValidateSupportedDigestFormat(digest, out _, out _);
         string path = Path.Combine(contentRoot, DigestUtils.GetEncoded(digest) + ".config.json");
         if (await TryReadAsync(path, digest, cancellationToken).ConfigureAwait(false) is { } cached)
         {
@@ -77,15 +75,25 @@ internal static class ConfigurationBlobCache
         try
         {
             using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
-            byte[] actual = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
-            InvalidDigestException.ThrowIfMismatched(DigestUtils.GetEncodedValue(digest), actual);
-            stream.Position = 0;
-            return await JsonNode.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return await ReadVerifiedAsync(stream, digest, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDigestException or JsonException)
         {
             return null;
         }
+    }
+
+    internal static async Task<JsonNode?> ReadVerifiedAsync(Stream stream, string digest, CancellationToken cancellationToken)
+    {
+        using MemoryStream snapshot = new();
+        await stream.CopyToAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        ReadOnlySpan<byte> content = snapshot.GetBuffer().AsSpan(0, checked((int)snapshot.Length));
+        DigestUtils.ValidateDigestContent(digest, content);
+        cancellationToken.ThrowIfCancellationRequested();
+        JsonNode? document = JsonNode.Parse(content);
+        cancellationToken.ThrowIfCancellationRequested();
+        return document;
     }
 
     private static async Task SaveAsync(string path, string contentRoot, ReadOnlyMemory<byte> content, CancellationToken cancellationToken)
