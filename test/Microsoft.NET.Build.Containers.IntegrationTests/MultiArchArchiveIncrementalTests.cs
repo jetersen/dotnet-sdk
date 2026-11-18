@@ -4,6 +4,7 @@
 using System.Formats.Tar;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Xml.Linq;
 
 namespace Microsoft.NET.Build.Containers.IntegrationTests;
 
@@ -12,22 +13,30 @@ public class MultiArchArchiveIncrementalTests : SdkTest
 {
     [TestMethod]
     [OSCondition(ConditionMode.Include, OperatingSystems.Linux | OperatingSystems.OSX)]
-    [DataRow(false)]
-    [DataRow(true)]
-    public async Task Default_publish_reuses_inner_images_and_outer_archive(bool useMultithreading)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    [DataRow(true, true)]
+    public async Task Default_publish_reuses_inner_images_and_outer_archive(bool useMultithreading, bool projectDefinedArchivePath)
     {
         await using ContainerTestRegistry registry = new();
-        var asset = TestAssetsManager.CopyTestAsset("HelloWorld", identifier: useMultithreading.ToString()).WithSource();
+        var asset = TestAssetsManager.CopyTestAsset("HelloWorld", identifier: $"{useMultithreading}-{projectDefinedArchivePath}").WithSource();
         string archive = Path.Combine(asset.TestRoot, "images.tar.gz");
         string cache = Directory.CreateDirectory(Path.Combine(asset.TestRoot, "cache")).FullName;
+        if (projectDefinedArchivePath)
+        {
+            asset.WithProjectChanges(project => project.Root!.Add(
+                new XElement("PropertyGroup", new XAttribute("Condition", "'$(RuntimeIdentifier)' == ''"),
+                    new XElement("ContainerArchiveOutputPath", archive))));
+        }
         string[] arguments = [
             "publish", "-t:PublishContainer", "-v:normal", $"-mt:{useMultithreading}",
             "-p:EnableSdkContainerSupport=true", "-p:UseAppHost=false", "-p:SelfContained=false",
             "-p:RuntimeIdentifiers=\"linux-x64;linux-arm64\"",
             $"-p:ContainerBaseImage={registry.Address}/empty:latest",
-            "-p:ContainerRepository=incremental-test", "-p:ContainerImageTag=test",
-            $"-p:ContainerArchiveOutputPath={archive}"
+            "-p:ContainerRepository=incremental-test", "-p:ContainerImageTag=test"
         ];
+        if (!projectDefinedArchivePath) arguments = [.. arguments, $"-p:ContainerArchiveOutputPath={archive}"];
         var first = Publish(arguments);
         first.Should().Pass();
         Assert.Contains("for runtime identifier", first.StdOut!);

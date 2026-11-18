@@ -353,6 +353,7 @@
           ContainerPushNoCache=$(ContainerPushNoCache);
           ContainerLayerNoIncremental=$(ContainerLayerNoIncremental);
           ContainerArchiveNoIncremental=$(ContainerArchiveNoIncremental);
+          ContainerArchiveOutputPath=$(ContainerArchiveOutputPath);
           _SkipContainerPublishing=$(_SkipContainerPublishing);
           ContainerImageFormat=$(_SingleImageContainerFormat);
           _IsMultiRIDBuild=false;

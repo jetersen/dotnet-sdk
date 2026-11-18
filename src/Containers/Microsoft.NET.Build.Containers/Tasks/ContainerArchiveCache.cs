@@ -62,7 +62,8 @@ internal static class ContainerArchiveCache
 
         string publishDirectory = Path.GetFullPath(task.PublishDirectory);
         AppendFile(hash, publishDirectory, ".", includeMode: true, cancellationToken);
-        foreach (string path in Directory.EnumerateFileSystemEntries(publishDirectory, "*", SearchOption.AllDirectories)
+        foreach (string path in Directory.EnumerateFileSystemEntries(publishDirectory, "*",
+            new EnumerationOptions { AttributesToSkip = FileAttributes.System, RecurseSubdirectories = true })
             .OrderBy(path => Path.GetRelativePath(publishDirectory, path), StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();

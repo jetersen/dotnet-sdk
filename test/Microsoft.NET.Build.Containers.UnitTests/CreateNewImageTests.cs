@@ -79,7 +79,9 @@ public class CreateNewImageTests
             File.WriteAllText(original.ArchiveIncrementalCachePath, validMetadata);
 
             Assert.IsTrue(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
-            File.WriteAllText(layerPath, "damaged");
+            byte[] damaged = File.ReadAllBytes(layerPath);
+            damaged[^1] ^= 1;
+            File.WriteAllBytes(layerPath, damaged);
             Assert.IsFalse(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
             File.Delete(layerPath);
             Assert.IsFalse(ContainerArchiveCache.TryRestore(original, "fingerprint", TestContext.CancellationToken));
@@ -87,6 +89,32 @@ public class CreateNewImageTests
         finally
         {
             if (layerPath is not null) File.Delete(layerPath);
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    [OSCondition(ConditionMode.Include, OperatingSystems.Windows)]
+    public void Archive_fingerprint_matches_layer_system_file_exclusions()
+    {
+        string directory = CreateTempDirectory();
+        string path = Path.Combine(directory, "app");
+        try
+        {
+            File.WriteAllText(path, "first");
+            CreateNewImage task = CreateIncrementalTask(directory);
+            string included = ComputeResolvedFingerprint(task);
+            File.SetAttributes(path, FileAttributes.System);
+            string excluded = ComputeResolvedFingerprint(task);
+            Assert.AreNotEqual(included, excluded);
+            File.WriteAllText(path, "other");
+            Assert.AreEqual(excluded, ComputeResolvedFingerprint(task));
+            File.SetAttributes(path, FileAttributes.Normal);
+            Assert.AreNotEqual(excluded, ComputeResolvedFingerprint(task));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.SetAttributes(path, FileAttributes.Normal);
             Directory.Delete(directory, recursive: true);
         }
     }
