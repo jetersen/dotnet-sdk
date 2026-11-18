@@ -13,15 +13,17 @@ public class MultiArchArchiveIncrementalTests : SdkTest
 {
     [TestMethod]
     [OSCondition(ConditionMode.Include, OperatingSystems.Linux | OperatingSystems.OSX)]
-    [DataRow(false, false)]
-    [DataRow(true, false)]
-    [DataRow(false, true)]
-    [DataRow(true, true)]
-    public async Task Default_publish_reuses_inner_images_and_outer_archive(bool useMultithreading, bool projectDefinedArchivePath)
+    [DataRow(false, false, false)]
+    [DataRow(true, false, false)]
+    [DataRow(false, true, false)]
+    [DataRow(true, true, false)]
+    [DataRow(false, true, true)]
+    [DataRow(true, true, true)]
+    public async Task Default_publish_reuses_inner_images_and_outer_archive(bool useMultithreading, bool projectDefinedArchivePath, bool specialFilename)
     {
         await using ContainerTestRegistry registry = new();
-        var asset = TestAssetsManager.CopyTestAsset("HelloWorld", identifier: $"{useMultithreading}-{projectDefinedArchivePath}").WithSource();
-        string archive = Path.Combine(asset.TestRoot, "images.tar.gz");
+        var asset = TestAssetsManager.CopyTestAsset("HelloWorld", identifier: $"{useMultithreading}-{projectDefinedArchivePath}-{specialFilename}").WithSource();
+        string archive = Path.Combine(asset.TestRoot, specialFilename ? "images;=signed.tar.gz" : "images.tar.gz");
         string cache = Directory.CreateDirectory(Path.Combine(asset.TestRoot, "cache")).FullName;
         if (projectDefinedArchivePath)
         {

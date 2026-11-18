@@ -78,9 +78,8 @@ internal static class ContainerArchiveCache
     public static bool TryRestore(CreateNewImage task, string fingerprint, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrEmpty(task.ArchiveOutputPath)
-            || string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
-            || (!task.SkipPublishing && !File.Exists(GetArchiveOutputPath(task)))
+        if (string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
+            || (!task.SkipPublishing && (string.IsNullOrEmpty(task.ArchiveOutputPath) || !File.Exists(GetArchiveOutputPath(task))))
             || !File.Exists(task.ArchiveIncrementalCachePath))
         {
             return false;
@@ -139,9 +138,8 @@ internal static class ContainerArchiveCache
     public static void Save(CreateNewImage task, string fingerprint, CancellationToken cancellationToken = default, string? archiveDigest = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrEmpty(task.ArchiveOutputPath)
-            || string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
-            || (!task.SkipPublishing && !File.Exists(GetArchiveOutputPath(task))))
+        if (string.IsNullOrEmpty(task.ArchiveIncrementalCachePath)
+            || (!task.SkipPublishing && (string.IsNullOrEmpty(task.ArchiveOutputPath) || !File.Exists(GetArchiveOutputPath(task)))))
         {
             return;
         }

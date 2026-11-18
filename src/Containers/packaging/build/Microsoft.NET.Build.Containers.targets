@@ -257,7 +257,7 @@
       <_ContainerLayerIncrementalCacheEnabled>true</_ContainerLayerIncrementalCacheEnabled>
       <_ContainerLayerIncrementalCacheEnabled Condition="'$(ContainerLayerNoIncremental)' == 'true'">false</_ContainerLayerIncrementalCacheEnabled>
       <_ContainerArchiveIncrementalCacheEnabled>false</_ContainerArchiveIncrementalCacheEnabled>
-      <_ContainerArchiveIncrementalCacheEnabled Condition="'$(ContainerArchiveNoIncremental)' == 'false' and '$(ContainerArchiveOutputPath)' != '' and '$(_IsSingleRIDBuild)' == 'true'">true</_ContainerArchiveIncrementalCacheEnabled>
+      <_ContainerArchiveIncrementalCacheEnabled Condition="'$(ContainerArchiveNoIncremental)' == 'false' and ('$(ContainerArchiveOutputPath)' != '' or '$(_ContainerMultiRIDArchive)' == 'true') and '$(_IsSingleRIDBuild)' == 'true'">true</_ContainerArchiveIncrementalCacheEnabled>
       <_ContainerArchiveIncrementalCachePath>$([System.IO.Path]::Combine('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'container', 'publish.cache.json'))</_ContainerArchiveIncrementalCachePath>
     </PropertyGroup>
 
@@ -321,6 +321,8 @@
       <!--We don't want to skip publishing individual images in case of remote registry because the individual images should be available in the registry before image index is pushed.-->
       <_SkipContainerPublishing>false</_SkipContainerPublishing>
       <_SkipContainerPublishing Condition="$(ContainerArchiveOutputPath) != '' or $(ContainerRegistry) == ''">true</_SkipContainerPublishing>
+      <_ContainerMultiRIDArchive>false</_ContainerMultiRIDArchive>
+      <_ContainerMultiRIDArchive Condition="'$(ContainerArchiveOutputPath)' != ''">true</_ContainerMultiRIDArchive>
 
       <!-- Figure out what format the inner images should be coerced to -->
       <!-- If a user had an opinion, use that -->
@@ -353,7 +355,7 @@
           ContainerPushNoCache=$(ContainerPushNoCache);
           ContainerLayerNoIncremental=$(ContainerLayerNoIncremental);
           ContainerArchiveNoIncremental=$(ContainerArchiveNoIncremental);
-          ContainerArchiveOutputPath=$(ContainerArchiveOutputPath);
+          _ContainerMultiRIDArchive=$(_ContainerMultiRIDArchive);
           _SkipContainerPublishing=$(_SkipContainerPublishing);
           ContainerImageFormat=$(_SingleImageContainerFormat);
           _IsMultiRIDBuild=false;

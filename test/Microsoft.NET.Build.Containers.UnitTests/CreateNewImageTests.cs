@@ -42,7 +42,9 @@ public class CreateNewImageTests
     }
 
     [TestMethod]
-    public void Inner_archive_cache_requires_an_intact_application_layer()
+    [DataRow(false)]
+    [DataRow(true)]
+    public void Inner_archive_cache_requires_an_intact_application_layer(bool includeArchivePath)
     {
         string directory = CreateTempDirectory();
         string? layerPath = null;
@@ -54,7 +56,7 @@ public class CreateNewImageTests
             layerPath = ContentStore.PathForDescriptor(layer.Descriptor);
             CreateNewImage original = CreateIncrementalTask(directory);
             original.SkipPublishing = true;
-            original.ArchiveOutputPath = Path.Combine(directory, "outer.tar");
+            original.ArchiveOutputPath = includeArchivePath ? Path.Combine(directory, "outer.tar") : string.Empty;
             original.ArchiveIncrementalCachePath = Path.Combine(directory, "cache.json");
             original.GeneratedContainerManifest = JsonSerializer.Serialize(new ManifestV2
             {
@@ -107,7 +109,7 @@ public class CreateNewImageTests
             File.SetAttributes(path, FileAttributes.System);
             string excluded = ComputeResolvedFingerprint(task);
             Assert.AreNotEqual(included, excluded);
-            File.WriteAllText(path, "other");
+            File.AppendAllText(path, "other");
             Assert.AreEqual(excluded, ComputeResolvedFingerprint(task));
             File.SetAttributes(path, FileAttributes.Normal);
             Assert.AreNotEqual(excluded, ComputeResolvedFingerprint(task));
