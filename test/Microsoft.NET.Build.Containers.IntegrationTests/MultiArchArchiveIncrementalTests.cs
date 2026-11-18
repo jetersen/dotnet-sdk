@@ -35,14 +35,15 @@ public class MultiArchArchiveIncrementalTests : SdkTest
             $"-p:ContainerBaseImage={registry.Address}/empty:latest", $"-p:ContainerRegistry={registry.Address}",
             "-p:ContainerRepository=names-test", "-p:ContainerImageTag=test"
         ];
+        string[] expectedLocalNames = ["names-test:test-linux-x64", "names-test:test-linux-arm64"];
         Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}"]).Should().Pass();
-        Assert.AreSequenceEqual(new[] { "names-test:test", "names-test:test" }, ReadNames());
+        Assert.AreSequenceEqual(expectedLocalNames, ReadNames());
 
         var changed = Publish(arguments);
         changed.Should().Pass();
         Assert.Contains("for runtime identifier", changed.StdOut!);
         string[] remoteNames = ReadNames();
-        Assert.ContainsOnly(name => name != "names-test:test", remoteNames);
+        Assert.ContainsOnly(name => !expectedLocalNames.Contains(name), remoteNames);
         var warm = Publish(arguments);
         warm.Should().Pass();
         Assert.DoesNotContain("for runtime identifier", warm.StdOut!);
@@ -54,7 +55,7 @@ public class MultiArchArchiveIncrementalTests : SdkTest
         local.Should().Pass();
         Assert.Contains("for runtime identifier", local.StdOut!);
         string[] localNames = ReadNames();
-        Assert.AreSequenceEqual(new[] { "names-test:test", "names-test:test" }, localNames);
+        Assert.AreSequenceEqual(expectedLocalNames, localNames);
         var warmLocal = Publish([.. arguments, $"-p:ContainerArchiveOutputPath={archive}"]);
         warmLocal.Should().Pass();
         Assert.DoesNotContain("for runtime identifier", warmLocal.StdOut!);
