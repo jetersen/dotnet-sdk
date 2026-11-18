@@ -50,6 +50,12 @@ feature (`Microsoft.NET.Build.Containers`).
   state, and a redirect or transient failure is not proof of registry acceptance. A rejected
   borrowed credential retains one independent acquisition. The pinned provider cannot
   terminate a running helper; cancellation stops waiting for its lookup instead.
+- **Archive downloads are bounded and output remains ordered.** Share each distinct
+  blob download within one archive and write layers in image order as verified files
+  become ready. Own input streams through failure/cancellation and await background
+  cleanup before returning. Outer tar blob ownership is normalized; image-layer bytes
+  and OCI identities must remain unchanged. See
+  [ContainerArchive.cs](Microsoft.NET.Build.Containers/LocalDaemons/ContainerArchive.cs).
 
 ## Tests
 

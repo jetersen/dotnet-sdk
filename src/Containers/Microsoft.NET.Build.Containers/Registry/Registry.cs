@@ -1,4 +1,4 @@
-// Licensed to the .NET Foundation under one or more agreements.
+﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using NuGet.Packaging;
@@ -405,9 +405,9 @@ internal sealed class Registry
 
         try
         {
-            var fileStream = File.OpenRead(localPath);
+            using FileStream fileStream = File.OpenRead(localPath);
 
-            var actualHash = SHA256.HashData(fileStream);
+            byte[] actualHash = await SHA256.HashDataAsync(fileStream, cancellationToken).ConfigureAwait(false);
             var expectedHash = DigestUtils.GetEncodedValue(descriptor.Digest);
             InvalidDigestException.ThrowIfMismatched(expectedHash, actualHash);
 
@@ -429,47 +429,55 @@ internal sealed class Registry
                 localPath, exception.Message);
         }
 
-        string tempTarballPath = ContentStore.GetTempFile();
-
-        int retryCount = 0;
-        while (retryCount < MaxDownloadRetries)
+        string tempTarballPath = Path.Combine(Path.GetDirectoryName(localPath)!,
+            $"{DigestUtils.GetEncoded(descriptor.Digest)}.{Guid.NewGuid():N}.tmp");
+        try
         {
-            try
+            int retryCount = 0;
+            while (retryCount < MaxDownloadRetries)
             {
-                // No local copy, so download one
-                using Stream responseStream = await _registryAPI.Blob
-                    // SAFETY: Content is checked against digest by CopyToAndVerifyAsync immediately below.
-                    .GetUnvalidatedStreamAsync(repository, descriptor.Digest, cancellationToken)
-                    .ConfigureAwait(false);
-
-                using (FileStream fs = File.Create(tempTarballPath))
+                try
                 {
-                    await responseStream
-                        .CopyToAndVerifyAsync(fs, descriptor.Digest, cancellationToken)
+                    // No local copy, so download one
+                    using Stream responseStream = await _registryAPI.Blob
+                        // SAFETY: Content is checked against digest by CopyToAndVerifyAsync immediately below.
+                        .GetUnvalidatedStreamAsync(repository, descriptor.Digest, cancellationToken)
                         .ConfigureAwait(false);
-                }
 
-                // Break the loop if successful
-                break;
-            }
-            catch (Exception ex) when (ex is not InvalidAuthResponseException and not InvalidAuthRealmConfigurationException)
-            {
-                retryCount++;
-                if (retryCount >= MaxDownloadRetries)
+                    using (FileStream fs = File.Create(tempTarballPath))
+                    {
+                        await responseStream
+                            .CopyToAndVerifyAsync(fs, descriptor.Digest, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+
+                    // Break the loop if successful
+                    break;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException and not InvalidAuthResponseException and not InvalidAuthRealmConfigurationException)
                 {
-                    throw new UnableToDownloadFromRepositoryException(repository);
+                    retryCount++;
+                    if (retryCount >= MaxDownloadRetries)
+                    {
+                        throw new UnableToDownloadFromRepositoryException(repository);
+                    }
+
+                    _logger.LogTrace("Download attempt {0}/{1} for repository '{2}' failed. Error: {3}", retryCount, MaxDownloadRetries, repository, ex.ToString());
+
+                    // Wait before retrying
+                    await Task.Delay(_retryDelayProvider(), cancellationToken).ConfigureAwait(false);
                 }
-
-                _logger.LogTrace("Download attempt {0}/{1} for repository '{2}' failed. Error: {3}", retryCount, MaxDownloadRetries, repository, ex.ToString());
-
-                // Wait before retrying
-                await Task.Delay(_retryDelayProvider(), cancellationToken).ConfigureAwait(false);
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(tempTarballPath, localPath, overwrite: true);
+
+            return localPath;
         }
-
-        File.Move(tempTarballPath, localPath, overwrite: true);
-
-        return localPath;
+        finally
+        {
+            File.Delete(tempTarballPath);
+        }
     }
 
     internal async Task PushLayerAsync(Layer layer, string repository, CancellationToken cancellationToken)

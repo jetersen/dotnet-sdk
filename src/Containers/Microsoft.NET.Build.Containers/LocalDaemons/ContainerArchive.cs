@@ -57,17 +57,19 @@ internal static class ContainerArchive
         Stream imageStream,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
+        await WriteWithDownloadsAsync([image], sourceReference, cancellationToken, async (layerPaths, token) =>
+        {
+            using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
 
-        JsonArray layerTarballPaths = new();
-        await WriteImageLayersAsync(writer, image, sourceReference, d => $"{d.Substring("sha256:".Length)}/layer.tar", cancellationToken, layerTarballPaths)
-            .ConfigureAwait(false);
+            JsonArray layerTarballPaths = new();
+            await WriteImageLayersAsync(writer, image, sourceReference, d => $"{d.Substring("sha256:".Length)}/layer.tar", token, layerPaths, layerTarballPaths)
+                .ConfigureAwait(false);
 
-        string configTarballPath = $"{GetRequiredImageSha(image)}.json";
-        await WriteImageConfigAsync(writer, image, configTarballPath, cancellationToken).ConfigureAwait(false);
-        await WriteManifestForDockerImageAsync(writer, destinationReference, configTarballPath, layerTarballPaths, cancellationToken)
-            .ConfigureAwait(false);
+            string configTarballPath = $"{GetRequiredImageSha(image)}.json";
+            await WriteImageConfigAsync(writer, image, configTarballPath, token).ConfigureAwait(false);
+            await WriteManifestForDockerImageAsync(writer, destinationReference, configTarballPath, layerTarballPaths, token)
+                .ConfigureAwait(false);
+        }).ConfigureAwait(false);
     }
 
     internal static async Task WriteOciImageToStreamAsync(
@@ -77,12 +79,14 @@ internal static class ContainerArchive
         Stream imageStream,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
+        await WriteWithDownloadsAsync([image], sourceReference, cancellationToken, async (layerPaths, token) =>
+        {
+            using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
 
-        await WriteOciImageToBlobsAsync(writer, image, sourceReference, cancellationToken).ConfigureAwait(false);
-        await WriteIndexJsonForOciImageAsync(writer, image, destinationReference, cancellationToken).ConfigureAwait(false);
-        await WriteOciLayoutAsync(writer, cancellationToken).ConfigureAwait(false);
+            await WriteOciImageToBlobsAsync(writer, image, sourceReference, token, layerPaths).ConfigureAwait(false);
+            await WriteIndexJsonForOciImageAsync(writer, image, destinationReference, token).ConfigureAwait(false);
+            await WriteOciLayoutAsync(writer, token).ConfigureAwait(false);
+        }).ConfigureAwait(false);
     }
 
     public static async Task WriteMultiArchOciImageToStreamAsync(
@@ -92,18 +96,103 @@ internal static class ContainerArchive
         Stream imageStream,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
-
-        Debug.Assert(multiArchImage.Images is not null);
-        foreach (BuiltImage image in multiArchImage.Images)
+        await WriteWithDownloadsAsync(multiArchImage.Images!, sourceReference, cancellationToken, async (layerPaths, token) =>
         {
-            await WriteOciImageToBlobsAsync(writer, image, sourceReference, cancellationToken).ConfigureAwait(false);
+            using TarWriter writer = new(imageStream, TarEntryFormat.Pax, leaveOpen: true);
+
+            Debug.Assert(multiArchImage.Images is not null);
+            foreach (BuiltImage image in multiArchImage.Images)
+            {
+                await WriteOciImageToBlobsAsync(writer, image, sourceReference, token, layerPaths).ConfigureAwait(false);
+            }
+
+            await WriteIndexJsonForMultiArchOciImageAsync(writer, multiArchImage, destinationReference, token)
+                .ConfigureAwait(false);
+            await WriteOciLayoutAsync(writer, token).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    private static async Task WriteWithDownloadsAsync(
+        IEnumerable<BuiltImage> images,
+        SourceImageReference sourceReference,
+        CancellationToken cancellationToken,
+        Func<LayerDownloads, CancellationToken, Task> write)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await using LayerDownloads downloads = new(images, sourceReference, cancellationToken);
+        try
+        {
+            await write(downloads, downloads.Token).ConfigureAwait(false);
+            await downloads.Completion.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && downloads.Token.IsCancellationRequested)
+        {
+            // A failed download cancels an in-progress write. Report that original
+            // failure rather than translating it into a successful cancelled task.
+            await downloads.Completion.ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    internal sealed class LayerDownloads : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _cancellation;
+        private readonly Dictionary<string, TaskCompletionSource<string>> _paths;
+
+        internal LayerDownloads(IEnumerable<BuiltImage> images, SourceImageReference source, CancellationToken cancellationToken)
+        {
+            Descriptor[] layers = images.SelectMany(image => image.LayerDescriptors).DistinctBy(layer => layer.Digest).ToArray();
+            _paths = layers.ToDictionary(layer => layer.Digest,
+                _ => new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously), StringComparer.Ordinal);
+            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Completion = DownloadAsync(layers, source);
         }
 
-        await WriteIndexJsonForMultiArchOciImageAsync(writer, multiArchImage, destinationReference, cancellationToken)
-            .ConfigureAwait(false);
-        await WriteOciLayoutAsync(writer, cancellationToken).ConfigureAwait(false);
+        internal CancellationToken Token => _cancellation.Token;
+        internal Task Completion { get; }
+        internal Task<string> GetPathAsync(string digest, CancellationToken cancellationToken)
+            => _paths[digest].Task.WaitAsync(cancellationToken);
+
+        private async Task DownloadAsync(Descriptor[] layers, SourceImageReference source)
+        {
+            try
+            {
+                // Completed, verified blobs remain on disk. The writer consumes them
+                // in image order while at most four later blobs download concurrently.
+                await Parallel.ForEachAsync(layers,
+                    new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = Token },
+                    async (layer, token) =>
+                    {
+                        Registry registry = source.Registry ?? throw new NotImplementedException(
+                            Resource.FormatString(nameof(Strings.MissingLinkToRegistry), layer.Digest, "<null>"));
+                        string path = await registry.DownloadBlobAsync(source.Repository, layer, token).ConfigureAwait(false);
+                        _paths[layer.Digest].SetResult(path);
+                    }).ConfigureAwait(false);
+            }
+            catch
+            {
+                _cancellation.Cancel();
+                throw;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _cancellation.Cancel();
+            try
+            {
+                await Completion.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Observe background failures during abort without masking a writer
+                // error. Normal completion and download failures are awaited above.
+            }
+            finally
+            {
+                _cancellation.Dispose();
+            }
+        }
     }
 
     private static async Task WriteImageLayersAsync(
@@ -112,6 +201,7 @@ internal static class ContainerArchive
         SourceImageReference sourceReference,
         Func<string, string> layerPathFunc,
         CancellationToken cancellationToken,
+        LayerDownloads layerPaths,
         JsonArray? layerTarballPaths = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -127,9 +217,23 @@ internal static class ContainerArchive
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            string localPath = await registry.DownloadBlobAsync(sourceReference.Repository, descriptor, cancellationToken).ConfigureAwait(false);
+            string localPath = await layerPaths.GetPathAsync(descriptor.Digest, cancellationToken).ConfigureAwait(false);
             string layerTarballPath = layerPathFunc(descriptor.Digest);
-            await writer.WriteEntryAsync(localPath, layerTarballPath, cancellationToken).ConfigureAwait(false);
+            // Own the input stream so a failed/cancelled tar write always closes it.
+            // TarWriter's file-path overload in the pinned runtime disposes only on success.
+            await using FileStream layerStream = new(localPath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, bufferSize: 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            DateTimeOffset modificationTime = File.GetLastWriteTimeUtc(localPath);
+            PaxTarEntry layerEntry = new(TarEntryType.RegularFile, layerTarballPath)
+            {
+                DataStream = layerStream,
+                Mode = OperatingSystem.IsWindows()
+                    ? Layer.DetermineFileMode(new FileInfo(localPath))
+                    : File.GetUnixFileMode(localPath),
+                ModificationTime = OperatingSystem.IsWindows() ? modificationTime
+                    : DateTimeOffset.FromUnixTimeSeconds(modificationTime.ToUnixTimeSeconds())
+            };
+            await writer.WriteEntryAsync(layerEntry, cancellationToken).ConfigureAwait(false);
             layerTarballPaths?.Add(layerTarballPath);
         }
     }
@@ -249,9 +353,10 @@ internal static class ContainerArchive
         TarWriter writer,
         BuiltImage image,
         SourceImageReference sourceReference,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        LayerDownloads layerPaths)
     {
-        await WriteImageLayersAsync(writer, image, sourceReference, d => $"{BlobsPath}/{d.Substring("sha256:".Length)}", cancellationToken)
+        await WriteImageLayersAsync(writer, image, sourceReference, d => $"{BlobsPath}/{d.Substring("sha256:".Length)}", cancellationToken, layerPaths)
             .ConfigureAwait(false);
         await WriteImageConfigAsync(writer, image, $"{BlobsPath}/{GetRequiredImageSha(image)}", cancellationToken).ConfigureAwait(false);
         await WriteManifestForOciImageAsync(writer, image, cancellationToken).ConfigureAwait(false);
