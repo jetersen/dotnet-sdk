@@ -98,144 +98,151 @@ internal class Layer
             entryAttributes["MSWINDOWS.rawsd"] = BuiltinUsersSecurityDescriptor;
         }
 
-        string tempTarballPath = ContentStore.GetTempFile();
-        using (FileStream fs = File.Create(tempTarballPath))
+        string tempTarballPath = Path.Combine(ContentStore.ContentRoot, $"{Guid.NewGuid():N}.tmp");
+        try
         {
-            using (LayerTarGZipStream layerStream = new(fs, leaveOpen: true))
+            using (FileStream fs = File.Create(tempTarballPath))
             {
-                using (TarWriter writer = new(layerStream, TarEntryFormat.Pax, leaveOpen: true))
+                using (LayerTarGZipStream layerStream = new(fs, leaveOpen: true))
                 {
-                    // Windows layers need a Files folder
-                    if (isWindowsLayer)
+                    using (TarWriter writer = new(layerStream, TarEntryFormat.Pax, leaveOpen: true))
                     {
-                        var entry = new PaxTarEntry(TarEntryType.Directory, "Files", entryAttributes)
+                        // Windows layers need a Files folder
+                        if (isWindowsLayer)
                         {
-                            ModificationTime = entryModificationTime
-                        };
-                        WriteEntry(writer, layerStream, entry);
-                    }
+                            var entry = new PaxTarEntry(TarEntryType.Directory, "Files", entryAttributes)
+                            {
+                                ModificationTime = entryModificationTime
+                            };
+                            WriteEntry(writer, layerStream, entry);
+                        }
 
-                    // Write an entry for the application directory.
-                    WriteTarEntryForFile(writer, layerStream, new DirectoryInfo(directory), containerPath, entryAttributes, isWindowsLayer ? null : userId, entryModificationTime);
+                        // Write an entry for the application directory.
+                        WriteTarEntryForFile(writer, layerStream, new DirectoryInfo(directory), containerPath, entryAttributes, isWindowsLayer ? null : userId, entryModificationTime);
 
-                    // Write entries for the application directory contents.
-                    var fileList = new FileSystemEnumerable<(FileSystemInfo file, string containerPath)>(
-                                directory: directory,
-                                transform: (ref FileSystemEntry entry) =>
-                                {
-                                    FileSystemInfo fsi = entry.ToFileSystemInfo();
-                                    string relativePath = Path.GetRelativePath(directory, fsi.FullName);
-                                    if (OperatingSystem.IsWindows())
+                        // Write entries for the application directory contents.
+                        var fileList = new FileSystemEnumerable<(FileSystemInfo file, string containerPath)>(
+                                    directory: directory,
+                                    transform: (ref FileSystemEntry entry) =>
                                     {
-                                        // Use only '/' directory separators.
-                                        relativePath = relativePath.Replace('\\', '/');
-                                    }
-                                    return (fsi, $"{containerPath}/{relativePath}");
-                                },
-                                options: new EnumerationOptions()
-                                {
-                                    AttributesToSkip = FileAttributes.System, // Include hidden files
-                                    RecurseSubdirectories = true
-                                });
-                    // The enumeration order of a directory is filesystem-defined, so it is sorted to keep
-                    // the order of entries in the tar stream stable across machines and builds.
-                    foreach (var item in fileList.OrderBy(static item => item.containerPath, StringComparer.Ordinal))
-                    {
-                        WriteTarEntryForFile(writer, layerStream, item.file, item.containerPath, entryAttributes, isWindowsLayer ? null : userId, entryModificationTime);
-                    }
-
-                    // Windows layers need a Hives folder, we do not need to create any Registry Hive deltas inside
-                    if (isWindowsLayer)
-                    {
-                        var entry = new PaxTarEntry(TarEntryType.Directory, "Hives", entryAttributes)
+                                        FileSystemInfo fsi = entry.ToFileSystemInfo();
+                                        string relativePath = Path.GetRelativePath(directory, fsi.FullName);
+                                        if (OperatingSystem.IsWindows())
+                                        {
+                                            // Use only '/' directory separators.
+                                            relativePath = relativePath.Replace('\\', '/');
+                                        }
+                                        return (fsi, $"{containerPath}/{relativePath}");
+                                    },
+                                    options: new EnumerationOptions()
+                                    {
+                                        AttributesToSkip = FileAttributes.System, // Include hidden files
+                                        RecurseSubdirectories = true
+                                    });
+                        // The enumeration order of a directory is filesystem-defined, so it is sorted to keep
+                        // the order of entries in the tar stream stable across machines and builds.
+                        foreach (var item in fileList.OrderBy(static item => item.containerPath, StringComparer.Ordinal))
                         {
-                            ModificationTime = entryModificationTime
+                            WriteTarEntryForFile(writer, layerStream, item.file, item.containerPath, entryAttributes, isWindowsLayer ? null : userId, entryModificationTime);
+                        }
+
+                        // Windows layers need a Hives folder, we do not need to create any Registry Hive deltas inside
+                        if (isWindowsLayer)
+                        {
+                            var entry = new PaxTarEntry(TarEntryType.Directory, "Hives", entryAttributes)
+                            {
+                                ModificationTime = entryModificationTime
+                            };
+                            WriteEntry(writer, layerStream, entry);
+                        }
+
+                    } // Dispose of the TarWriter before getting the hash so the final data get written to the tar stream
+
+                    int bytesWritten = layerStream.GetCurrentUncompressedHash(uncompressedHash);
+                    Debug.Assert(bytesWritten == uncompressedHash.Length);
+                }
+
+                fileSize = fs.Length;
+
+                fs.Position = 0;
+
+                int bW = SHA256.HashData(fs, hash);
+                Debug.Assert(bW == hash.Length);
+
+                static void WriteEntry(TarWriter writer, LayerTarGZipStream layerStream, PaxTarEntry entry)
+                {
+                    layerStream.NormalizeNextHeader();
+                    writer.WriteEntry(entry);
+                }
+
+                // Writes a tar entry corresponding to the file system item.
+                static void WriteTarEntryForFile(TarWriter writer, LayerTarGZipStream layerStream, FileSystemInfo file, string containerPath, IEnumerable<KeyValuePair<string, string>> entryAttributes, int? userId, DateTimeOffset modificationTime)
+                {
+                    UnixFileMode mode = DetermineFileMode(file);
+                    PaxTarEntry entry;
+
+                    if (file is FileInfo)
+                    {
+                        var fileStream = File.OpenRead(file.FullName);
+                        entry = new(TarEntryType.RegularFile, containerPath, entryAttributes)
+                        {
+                            DataStream = fileStream,
                         };
-                        WriteEntry(writer, layerStream, entry);
+                    }
+                    else
+                    {
+                        entry = new(TarEntryType.Directory, containerPath, entryAttributes);
                     }
 
-                } // Dispose of the TarWriter before getting the hash so the final data get written to the tar stream
-
-                int bytesWritten = layerStream.GetCurrentUncompressedHash(uncompressedHash);
-                Debug.Assert(bytesWritten == uncompressedHash.Length);
-            }
-
-            fileSize = fs.Length;
-
-            fs.Position = 0;
-
-            int bW = SHA256.HashData(fs, hash);
-            Debug.Assert(bW == hash.Length);
-
-            static void WriteEntry(TarWriter writer, LayerTarGZipStream layerStream, PaxTarEntry entry)
-            {
-                layerStream.NormalizeNextHeader();
-                writer.WriteEntry(entry);
-            }
-
-            // Writes a tar entry corresponding to the file system item.
-            static void WriteTarEntryForFile(TarWriter writer, LayerTarGZipStream layerStream, FileSystemInfo file, string containerPath, IEnumerable<KeyValuePair<string, string>> entryAttributes, int? userId, DateTimeOffset modificationTime)
-            {
-                UnixFileMode mode = DetermineFileMode(file);
-                PaxTarEntry entry;
-
-                if (file is FileInfo)
-                {
-                    var fileStream = File.OpenRead(file.FullName);
-                    entry = new(TarEntryType.RegularFile, containerPath, entryAttributes)
+                    entry.Mode = mode;
+                    entry.ModificationTime = modificationTime;
+                    if (userId is int uid)
                     {
-                        DataStream = fileStream,
-                    };
-                }
-                else
-                {
-                    entry = new(TarEntryType.Directory, containerPath, entryAttributes);
-                }
+                        entry.Uid = uid;
+                    }
 
-                entry.Mode = mode;
-                entry.ModificationTime = modificationTime;
-                if (userId is int uid)
-                {
-                    entry.Uid = uid;
+                    WriteEntry(writer, layerStream, entry);
+
+                    if (entry.DataStream is not null)
+                    {
+                        // no longer relying on the `using` of the FileStream, so need to do it manually
+                        entry.DataStream.Dispose();
+                    }
+
                 }
-
-                WriteEntry(writer, layerStream, entry);
-
-                if (entry.DataStream is not null)
-                {
-                    // no longer relying on the `using` of the FileStream, so need to do it manually
-                    entry.DataStream.Dispose();
-                }
-
             }
+
+            string contentHash = Convert.ToHexStringLower(hash);
+            string uncompressedContentHash = Convert.ToHexStringLower(uncompressedHash);
+
+            string layerMediaType = manifestMediaType switch
+            {
+                 // TODO: configurable? gzip always?
+                SchemaTypes.DockerManifestV2 => SchemaTypes.DockerLayerGzip,
+                SchemaTypes.OciManifestV1 => SchemaTypes.OciLayerGzipV1,
+                _ => throw new ArgumentException(Resource.FormatString(nameof(Strings.UnrecognizedMediaType), manifestMediaType))
+            };
+
+            Descriptor descriptor = new()
+            {
+                MediaType = layerMediaType,
+                Size = fileSize,
+                Digest = $"sha256:{contentHash}",
+                UncompressedDigest = $"sha256:{uncompressedContentHash}",
+            };
+
+            string storedContent = ContentStore.PathForDescriptor(descriptor);
+
+            Directory.CreateDirectory(ContentStore.ContentRoot);
+
+            ContentStore.CommitBlob(tempTarballPath, storedContent, descriptor.Digest);
+
+            return new(storedContent, descriptor);
         }
-
-        string contentHash = Convert.ToHexStringLower(hash);
-        string uncompressedContentHash = Convert.ToHexStringLower(uncompressedHash);
-
-        string layerMediaType = manifestMediaType switch
+        finally
         {
-             // TODO: configurable? gzip always?
-            SchemaTypes.DockerManifestV2 => SchemaTypes.DockerLayerGzip,
-            SchemaTypes.OciManifestV1 => SchemaTypes.OciLayerGzipV1,
-            _ => throw new ArgumentException(Resource.FormatString(nameof(Strings.UnrecognizedMediaType), manifestMediaType))
-        };
-
-        Descriptor descriptor = new()
-        {
-            MediaType = layerMediaType,
-            Size = fileSize,
-            Digest = $"sha256:{contentHash}",
-            UncompressedDigest = $"sha256:{uncompressedContentHash}",
-        };
-
-        string storedContent = ContentStore.PathForDescriptor(descriptor);
-
-        Directory.CreateDirectory(ContentStore.ContentRoot);
-
-        File.Move(tempTarballPath, storedContent, overwrite: true);
-
-        return new(storedContent, descriptor);
+            File.Delete(tempTarballPath);
+        }
     }
 
     internal static UnixFileMode DetermineFileMode(FileSystemInfo file)

@@ -20,3 +20,7 @@ and across SDK processes. Completed blobs are verified before reuse. Filesystem 
 are optional: unavailable locking falls back to independent downloads, and a contended
 cross-process lease waits up to 30 seconds before falling back. Empty `.download.lock`
 files remain in the content store so concurrent publishers keep using the same lock file.
+
+Application layers are written to temporary files beside their content-store destination
+and committed atomically. A concurrent reader does not prevent reusing an identical,
+fully verified layer committed by another publisher.

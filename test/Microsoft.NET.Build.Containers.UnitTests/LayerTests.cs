@@ -53,6 +53,34 @@ public class LayerTests
         }
     }
 
+    [TestMethod]
+    public async Task Identical_application_layers_can_commit_while_the_winner_is_read()
+    {
+        DirectoryInfo folder = Directory.CreateTempSubdirectory();
+        string? backingFile = null;
+        try
+        {
+            File.WriteAllText(Path.Join(folder.FullName, "payload"), Guid.NewGuid().ToString());
+            DateTimeOffset timestamp = DateTimeOffset.FromUnixTimeSeconds(1700000000);
+            Layer first = Layer.FromDirectory(folder.FullName, "/app", false, SchemaTypes.OciManifestV1, null, timestamp);
+            backingFile = first.BackingFile;
+            using FileStream reader = File.OpenRead(backingFile);
+            Layer[] layers = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+                Layer.FromDirectory(folder.FullName, "/app", false, SchemaTypes.OciManifestV1, null, timestamp))));
+            foreach (Layer layer in layers)
+            {
+                Assert.AreEqual(first.Descriptor.Digest, layer.Descriptor.Digest);
+                Assert.AreEqual(first.BackingFile, layer.BackingFile);
+            }
+            Assert.AreEqual(first.Descriptor.Size, reader.Length);
+        }
+        finally
+        {
+            if (backingFile is not null) File.Delete(backingFile);
+            folder.Delete(recursive: true);
+        }
+    }
+
     private static Dictionary<string, TarEntry> LoadAllTarEntries(string file)
     {
         using var gzip = new GZipStream(File.OpenRead(file), CompressionMode.Decompress);
