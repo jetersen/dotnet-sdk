@@ -89,6 +89,13 @@ partial class CreateImageIndex
     [Output]
     public string GeneratedImageIndex { get; set; }
 
+    /// <summary>
+    /// The SHA-256 digest of the UTF-8 bytes of <see cref="GeneratedImageIndex"/>.
+    /// Identifies generated content; it is not confirmation of a successful publish.
+    /// </summary>
+    [Output]
+    public string GeneratedImageIndexDigest { get; set; }
+
     public CreateImageIndex()
     {
         BaseRegistry = string.Empty;
@@ -105,6 +112,7 @@ partial class CreateImageIndex
         SourceDateEpoch = string.Empty;
         GeneratedArchiveOutputPath = string.Empty;
         GeneratedImageIndex = string.Empty;
+        GeneratedImageIndexDigest = string.Empty;
 
         TaskResources = Resource.Manager;
     }
